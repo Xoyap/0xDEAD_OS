@@ -3,41 +3,80 @@ default rel
 
 global _e
 
-%define ST_BS 96
-%define BS_LP 0x140
-%define GOP_M 24
-%define M_INF 8
-%define M_FB 24
-%define M_FBS 32
-%define I_HRES 4
-%define I_VRES 8
-%define I_SL 32
+;================ defines =================
 
-%define CHAR_W 9
-%define CHAR_H 10
+; System Table offsets
+%define ST_CONIN_OFFSET        0x30
+%define ST_BS                  96
+%define BS_LP                  0x140
 
-%define START_X 100
-%define START_Y 100
+; Boot Services offsets
+%define BS_WAIT_FOR_EVENT      96
+%define BS_STALL               248
 
-%define CURSOR_W 8
-%define CURSOR_H 10
-%define CURSOR_DELAY 50000
+; GOP offsets
+%define GOP_MODE               24
+%define M_INF                  8
+%define M_FB                   24
+%define I_HRES                 4
+%define I_VRES                 8
+%define I_SL                   32
+
+; Character dimensions
+%define GLYPH_W                8
+%define GLYPH_H                8
+%define CHAR_W                 9
+%define CHAR_H                 10
+
+; Starting position
+%define START_X                100
+%define START_Y                100
+
+; Special characters
+%define KEY_BACKSPACE          8
+%define KEY_ENTER              10
+%define KEY_SPACE              32
+%define KEY_DELETE             127
+%define CHAR_CR                13
+%define CHAR_LF                10
+%define CHAR_TAB               9
+
+; UEFI scan code compatibility
+%define EFI_SCAN_DELETE        8
+
+struc Video
+    .fb:        resq 1
+    .sl:        resq 1
+    .w:         resq 1
+    .h:         resq 1
+    .fg:        resq 1
+    .bg:        resq 1
+    .cx:        resq 1
+    .cy:        resq 1
+endstruc
 
 section .text
 
 ;================ entry =================
 
 _e:
+    cld
     and rsp, -16
     sub rsp, 32
 
     mov r12, rdx
 
-    mov rax, [r12 + 0x30]
+    mov rax, [r12 + ST_CONIN_OFFSET]
     mov [conin], rax
 
     mov rbx, [r12 + ST_BS]
+    test rbx, rbx
+    jz fail
+    mov [bs], rbx
+
     mov rax, [rbx + BS_LP]
+    test rax, rax
+    jz fail
 
     ;================ gop =================
 
@@ -57,14 +96,14 @@ _e:
     test rbx, rbx
     jz fail
 
-    mov rbx, [rbx + GOP_M]
+    mov rbx, [rbx + GOP_MODE]
     test rbx, rbx
     jz fail
 
     mov rax, [rbx + M_FB]
     test rax, rax
     jz fail
-    mov [fb], rax
+    mov [video + Video.fb], rax
 
     mov rsi, [rbx + M_INF]
     test rsi, rsi
@@ -75,132 +114,179 @@ _e:
     jnz .hres_ok
     mov eax, 1
 .hres_ok:
-    mov [screen_width], rax
+    mov [video + Video.w], rax
 
     mov eax, [rsi + I_VRES]
     test eax, eax
     jnz .vres_ok
     mov eax, 1
 .vres_ok:
-    mov [screen_height], rax
+    mov [video + Video.h], rax
 
     mov eax, [rsi + I_SL]
     test eax, eax
     jnz .stride_ok
-    mov eax, [rsi + I_HRES]
+    mov eax, [video + Video.w]
     test eax, eax
     jnz .stride_ok
     mov eax, 1
 .stride_ok:
-    mov [sl], eax
+    mov [video + Video.sl], rax
 
-    mov eax, [sl]
-    cmp [screen_width], rax
+    mov rax, [video + Video.sl]
+    cmp qword [video + Video.w], rax
     jbe .width_ok
-    mov [screen_width], rax
+    mov [video + Video.w], rax
 .width_ok:
 
-    ;================ clear =================
+    ;================ init =================
 
-    mov rcx, [rbx + M_FBS]
-    test rcx, rcx
-    jnz .clear_ok
+    mov qword [video + Video.fg], 0x00FFFFFF
+    mov qword [video + Video.bg], 0x00000000
 
-    mov eax, [sl]
-    mov rcx, [screen_height]
-    mul rcx
-    mov rcx, rax
-    jmp .clear_do
+    call console_clear
 
-.clear_ok:
-    shr rcx, 2
+    mov rax, [video + Video.w]
+    cmp rax, START_X + CHAR_W
+    jae .margin_ok
+    mov qword [margin_x], 0
+.margin_ok:
 
-.clear_do:
-    xor eax, eax
-    mov rdi, [fb]
-    cld
-    rep stosd
-
-    ;================ start =================
-
-    mov qword [cursor_x], START_X
-    mov qword [cursor_y], START_Y
+    mov rax, [margin_x]
+    mov [video + Video.cx], rax
+    mov qword [video + Video.cy], START_Y
 
     call ensure_y
 
     lea r9, [msg]
     call draw_text
 
-    call init_keyboard
+    call keyboard_init
 
-    call draw_cursor
-    mov byte [cursor_state], 1
-    mov qword [cursor_timer], CURSOR_DELAY
+    ;================ start key loop =================
 
-    ;================ main =================
+    call key_event_init
+    cmp byte [events_ready], 1
+    je .event_loop
 
-.main_loop:
-    call keyboard_poll
+;================ fallback busy loop =================
+
+.busy_loop:
+    call keyboard_get
     test al, al
-    jz .tick
+    jz .busy_tick
 
-    call erase_cursor_if_visible
+    call process_key
+    jmp .busy_loop
 
-    cmp al, 8
-    je .do_backspace
-    cmp al, 10
-    je .do_newline
+.busy_tick:
+    call stall_1ms
+    jmp .busy_loop
 
-    mov r9b, al
-    call console_putc
-    jmp .show_cursor
+;================ event-based key loop =================
 
-.do_backspace:
-    call backspace
-    jmp .show_cursor
+.event_loop:
+    call wait_key_event
+    test rax, rax
+    jnz .busy_loop
 
-.do_newline:
-    call newline
-
-.show_cursor:
-    call draw_cursor
-    mov byte [cursor_state], 1
-    mov qword [cursor_timer], CURSOR_DELAY
-
-.tick:
-    call cursor_tick
-    jmp .main_loop
-
-;================ text =================
-
-draw_text:
-    push rsi
-    mov rsi, r9
-
-.next:
-    mov al, [rsi]
+    call keyboard_get
     test al, al
-    jz .done
+    jz .event_loop
 
-    cmp al, 10
+    call process_key
+    jmp .event_loop
+
+;================ key processing =================
+
+process_key:
+    cmp al, KEY_BACKSPACE
+    je .backspace
+
+    cmp al, KEY_ENTER
     je .newline
 
     mov r9b, al
     call console_putc
+    ret
 
-    inc rsi
-    jmp .next
+.backspace:
+    call backspace
+    ret
 
 .newline:
     call newline
-    inc rsi
-    jmp .next
-
-.done:
-    pop rsi
     ret
 
-;================ putc =================
+;================ console API =================
+
+console_clear:
+    push rdi
+    push rcx
+    push rax
+
+    cld
+    mov rdi, [video + Video.fb]
+
+    mov rax, [video + Video.sl]
+    mov rcx, [video + Video.h]
+    imul rax, rcx
+    mov rcx, rax
+
+    mov eax, [video + Video.bg]
+    rep stosd
+
+    pop rax
+    pop rcx
+    pop rdi
+    ret
+
+console_scroll:
+    push rsi
+    push rdi
+    push rcx
+    push rax
+    push rdx
+
+    cld
+
+    mov rdi, [video + Video.fb]
+    mov rax, [video + Video.h]
+    cmp rax, CHAR_H
+    jbe .done
+
+    mov rax, [video + Video.sl]
+    imul rax, CHAR_H
+    lea rsi, [rdi + rax * 4]
+
+    mov rax, [video + Video.sl]
+    mov rcx, [video + Video.h]
+    sub rcx, CHAR_H
+    imul rax, rcx
+    mov rcx, rax
+    rep movsd
+
+    ; Clear bottom line
+    mov rdi, [video + Video.fb]
+    mov rax, [video + Video.sl]
+    mov rcx, [video + Video.h]
+    sub rcx, CHAR_H
+    imul rax, rcx
+    lea rdi, [rdi + rax * 4]
+
+    mov rax, [video + Video.sl]
+    imul rax, CHAR_H
+    mov rcx, rax
+    mov eax, [video + Video.bg]
+    rep stosd
+
+.done:
+    pop rdx
+    pop rax
+    pop rcx
+    pop rdi
+    pop rsi
+    ret
 
 console_putc:
     push rax
@@ -211,28 +297,48 @@ console_putc:
 
     movzx r12d, r9b
 
-    mov rax, [cursor_x]
+    cmp r12b, CHAR_CR
+    je .do_cr
+    cmp r12b, CHAR_LF
+    je .do_lf
+    cmp r12b, CHAR_TAB
+    je .do_tab
+
+    mov rax, [video + Video.cx]
     add rax, CHAR_W
-    cmp rax, [screen_width]
+    cmp rax, [video + Video.w]
     jbe .x_ok
     call newline
 .x_ok:
     call ensure_y
 
-    mov rcx, [cursor_x]
-    mov rdx, [cursor_y]
-    call erase_char
-
-    mov rcx, [cursor_x]
-    mov rdx, [cursor_y]
-    mov r8d, 0x00FFFFFF
+    ; Draw character
+    mov rcx, [video + Video.cx]
+    mov rdx, [video + Video.cy]
     mov r9b, r12b
-    call draw_char
+    call draw_char_with_bg
 
-    add qword [cursor_x], CHAR_W
+    add qword [video + Video.cx], CHAR_W
 
-    mov rax, [cursor_x]
-    cmp rax, [screen_width]
+    mov rax, [video + Video.cx]
+    cmp rax, [video + Video.w]
+    jb .exit
+    call newline
+    jmp .exit
+
+.do_cr:
+    mov rax, [margin_x]
+    mov [video + Video.cx], rax
+    jmp .exit
+
+.do_lf:
+    call newline
+    jmp .exit
+
+.do_tab:
+    add qword [video + Video.cx], CHAR_W * 4
+    mov rax, [video + Video.cx]
+    cmp rax, [video + Video.w]
     jb .exit
     call newline
 
@@ -244,225 +350,193 @@ console_putc:
     pop rax
     ret
 
+draw_char_with_bg:
+    push rbx
+    push rsi
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, rcx
+    mov r13, rdx
+    mov r14b, r9b
+
+    ; Draw background
+    mov rcx, r12
+    mov rdx, r13
+    mov r8d, CHAR_W
+    mov r9d, CHAR_H
+    call fill_rect_bg
+
+    ; Draw glyph
+    mov rcx, r12
+    mov rdx, r13
+    mov r8d, [video + Video.fg]
+    mov r9b, r14b
+    call draw_char
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rsi
+    pop rbx
+    ret
+
+draw_text:
+    push rsi
+    mov rsi, r9
+
+.next:
+    mov al, [rsi]
+    test al, al
+    jz .done
+
+    mov r9b, al
+    call console_putc
+
+    inc rsi
+    jmp .next
+
+.done:
+    pop rsi
+    ret
+
 ;================ edit =================
 
 backspace:
-    cmp qword [cursor_x], START_X
+    mov rax, [margin_x]
+    cmp qword [video + Video.cx], rax
     jle .done
 
-    sub qword [cursor_x], CHAR_W
+    sub qword [video + Video.cx], CHAR_W
 
-    mov rcx, [cursor_x]
-    mov rdx, [cursor_y]
-    call erase_char
+    mov rcx, [video + Video.cx]
+    mov rdx, [video + Video.cy]
+    mov r8d, CHAR_W
+    mov r9d, CHAR_H
+    call fill_rect_bg
 
 .done:
     ret
 
 newline:
-    mov qword [cursor_x], START_X
-    add qword [cursor_y], CHAR_H
+    mov rax, [margin_x]
+    mov [video + Video.cx], rax
+    add qword [video + Video.cy], CHAR_H
     call ensure_y
     ret
 
 ;================ view =================
 
 ensure_y:
-    mov rax, [screen_height]
+    mov rax, [video + Video.h]
     cmp rax, CHAR_H
     jbe .zero
 
-    mov rax, [cursor_y]
+    mov rax, [video + Video.cy]
     add rax, CHAR_H
-    cmp rax, [screen_height]
+    cmp rax, [video + Video.h]
     jbe .done
 
-    call scroll_up
+    call console_scroll
 
-    mov rax, [screen_height]
+    mov rax, [video + Video.h]
     sub rax, CHAR_H
-    mov [cursor_y], rax
+    mov [video + Video.cy], rax
     ret
 
 .zero:
-    mov qword [cursor_y], 0
+    mov qword [video + Video.cy], 0
 
 .done:
     ret
 
-;================ scroll =================
+;================ fill_rect =================
 
-scroll_up:
-    push rsi
-    push rdi
-    push rcx
-    push rax
-    push rdx
-
-    mov rdi, [fb]
-    mov rax, [screen_height]
-    cmp rax, CHAR_H
-    jbe .done
-
-    mov eax, [sl]
-    mov ecx, CHAR_H
-    mul rcx
-    lea rsi, [rdi + rax * 4]
-
-    mov eax, [sl]
-    mov rcx, [screen_height]
-    sub rcx, CHAR_H
-    mul rcx
-    mov rcx, rax
-    cld
-    rep movsd
-
-    mov rdi, [fb]
-    mov eax, [sl]
-    mov rcx, [screen_height]
-    sub rcx, CHAR_H
-    mul rcx
-    lea rdi, [rdi + rax * 4]
-
-    mov eax, [sl]
-    mov ecx, CHAR_H
-    mul rcx
-    mov rcx, rax
-    xor eax, eax
-    rep stosd
-
-.done:
-    pop rdx
-    pop rax
-    pop rcx
-    pop rdi
-    pop rsi
-    ret
-
-;================ cursor =================
-
-draw_cursor:
-    mov rdi, [fb]
-    mov eax, [sl]
-    mov rcx, [cursor_y]
-    imul rcx, rax
-    add rcx, [cursor_x]
-
-    mov r8, CURSOR_H
-
-.cy:
-    push r8
-    mov r9, CURSOR_W
-
-.cx:
-    mov dword [rdi + rcx * 4], 0x00FFFFFF
-    inc rcx
-    dec r9
-    jnz .cx
-
-    mov eax, [sl]
-    add rcx, rax
-    sub rcx, CURSOR_W
-
-    pop r8
-    dec r8
-    jnz .cy
-
-    ret
-
-erase_cursor:
-    mov rdi, [fb]
-    mov eax, [sl]
-    mov rcx, [cursor_y]
-    imul rcx, rax
-    add rcx, [cursor_x]
-
-    mov r8, CURSOR_H
-
-.ecy:
-    mov r9, CURSOR_W
-
-.ecx:
-    mov dword [rdi + rcx * 4], 0
-    inc rcx
-    dec r9
-    jnz .ecx
-
-    mov eax, [sl]
-    add rcx, rax
-    sub rcx, CURSOR_W
-
-    dec r8
-    jnz .ecy
-
-    ret
-
-;================ cell =================
-
-erase_char:
+fill_rect:
     push rbx
+    push rdi
+    push rsi
 
-    mov rdi, [fb]
-    mov ebx, [sl]
+    test r8, r8
+    jz .done
+    test r9, r9
+    jz .done
 
-    mov r10, rdx
-    imul r10, rbx
-    add r10, rcx
-    shl r10, 2
+    mov rax, [video + Video.w]
+    cmp rcx, rax
+    jae .done
 
-    mov r8, CHAR_H
+    mov r11, rcx
+    add r11, r8
+    cmp r11, rax
+    jbe .w_ok
+    mov r8, rax
+    sub r8, rcx
+.w_ok:
+
+    mov rax, [video + Video.h]
+    cmp rdx, rax
+    jae .done
+
+    mov r11, rdx
+    add r11, r9
+    cmp r11, rax
+    jbe .h_ok
+    mov r9, rax
+    sub r9, rdx
+.h_ok:
+
+    test r8, r8
+    jz .done
+    test r9, r9
+    jz .done
+
+    mov rdi, [video + Video.fb]
+    mov rbx, [video + Video.sl]
+
+    mov r11, rdx
+    imul r11, rbx
+    add r11, rcx
+    shl r11, 2
 
 .y:
-    mov r9, CHAR_W
+    push r9
+    mov rsi, r8
 
 .x:
-    mov dword [rdi + r10], 0
-    add r10, 4
-    dec r9
+    mov dword [rdi + r11], r10d
+    add r11, 4
+    dec rsi
     jnz .x
 
-    mov eax, [sl]
+    mov rax, [video + Video.sl]
+    sub rax, r8
     shl rax, 2
-    add r10, rax
-    sub r10, CHAR_W * 4
+    add r11, rax
 
-    dec r8
+    pop r9
+    dec r9
     jnz .y
 
+.done:
+    pop rsi
+    pop rdi
     pop rbx
     ret
 
-;================ blink =================
-
-cursor_tick:
-    dec qword [cursor_timer]
-    jnz .done
-
-    mov qword [cursor_timer], CURSOR_DELAY
-
-    cmp byte [cursor_state], 0
-    jne .hide
-
-    call draw_cursor
-    mov byte [cursor_state], 1
-    ret
-
-.hide:
-    call erase_cursor
-    mov byte [cursor_state], 0
-
-.done:
-    ret
-
-erase_cursor_if_visible:
-    cmp byte [cursor_state], 0
-    je .done
-    call erase_cursor
-    mov byte [cursor_state], 0
-.done:
+fill_rect_bg:
+    mov r10d, [video + Video.bg]
+    call fill_rect
     ret
 
 ;================ keyboard =================
+
+keyboard_init:
+    call init_keyboard
+    ret
 
 init_keyboard:
     push rbx
@@ -485,6 +559,10 @@ init_keyboard:
     pop rbx
     ret
 
+keyboard_get:
+    call keyboard_poll
+    ret
+
 keyboard_poll:
     push rbx
     push r12
@@ -503,26 +581,42 @@ keyboard_poll:
     test rax, rax
     jnz .nokey
 
+
+    movzx ecx, word [rsp + 32]
     movzx eax, word [rsp + 34]
 
-    cmp eax, 13
+    test eax, eax
+    jnz .have_unicode
+
+    cmp ecx, EFI_SCAN_DELETE
+    je .scan_backspace
+    jmp .nokey
+
+.scan_backspace:
+    mov eax, KEY_BACKSPACE
+    jmp .key_ok
+
+.have_unicode:
+    cmp eax, CHAR_CR
     jne .not_cr
-    mov eax, 10
+    mov eax, KEY_ENTER
 .not_cr:
 
-    cmp eax, 127
+    cmp eax, KEY_DELETE
     jne .not_del
-    mov eax, 8
+    mov eax, KEY_BACKSPACE
 .not_del:
 
-    cmp eax, 8
+    cmp eax, KEY_BACKSPACE
     je .key_ok
-    cmp eax, 10
+    cmp eax, KEY_ENTER
+    je .key_ok
+    cmp eax, CHAR_TAB
     je .key_ok
 
-    cmp eax, 32
+    cmp eax, KEY_SPACE
     jb .nokey
-    cmp eax, 127
+    cmp eax, KEY_DELETE
     ja .nokey
 
 .key_ok:
@@ -538,72 +632,163 @@ keyboard_poll:
     pop rbx
     ret
 
+;================ events =================
+
+key_event_init:
+    mov byte [events_ready], 0
+
+    mov rcx, [conin]
+    test rcx, rcx
+    jz .fail
+
+    mov rax, [rcx + 16]
+    test rax, rax
+    jz .fail
+
+    mov [key_event], rax
+    mov [event_array], rax
+    mov byte [events_ready], 1
+
+.fail:
+    ret
+
+wait_key_event:
+    push r12
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov rcx, 1
+    lea rdx, [event_array]
+    lea r8, [event_index]
+
+    mov rax, [bs]
+    test rax, rax
+    jz .error
+
+    call qword [rax + BS_WAIT_FOR_EVENT]
+    jmp .done
+
+.error:
+    mov eax, 1
+
+.done:
+    mov rsp, r12
+    pop r12
+    ret
+
+stall_1ms:
+    push r12
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov rcx, 1000        
+
+    mov rax, [bs]
+    test rax, rax
+    jz .done
+
+    call qword [rax + BS_STALL]
+
+.done:
+    mov rsp, r12
+    pop r12
+    ret
+
 ;================ char =================
 
 draw_char:
     push rbx
     push rsi
+    push rdi
     push r12
     push r13
     push r14
+    push r15
 
-    mov r12, rcx
-    mov r13, rdx
+    mov r12, rcx        
+    mov r13, rdx        
     mov r14d, r8d
-
     movzx eax, r9b
 
-    cmp eax, 32
-    jb .empty
-    cmp eax, 127
-    ja .empty
+    cmp eax, KEY_SPACE
+    jb .done
+    cmp eax, KEY_DELETE
+    ja .done
 
-    sub eax, 32
+    mov r15, [video + Video.w]
+    cmp r12, r15
+    jae .done
+
+    mov r15, [video + Video.h]
+    cmp r13, r15
+    jae .done
+
+    sub eax, KEY_SPACE
     shl eax, 3
 
     lea rsi, [font_table]
     add rsi, rax
 
-    mov rdi, [fb]
-    mov ebx, [sl]
+    mov rdi, [video + Video.fb]
+    mov r8, [video + Video.sl]
+
+    mov r15, [video + Video.w]
+    sub r15, r12
+    cmp r15, GLYPH_W
+    jbe .cols_ok
+    mov r15, GLYPH_W
+.cols_ok:
+
+    mov r9, [video + Video.h]
+    sub r9, r13
+    cmp r9, GLYPH_H
+    jbe .rows_ok
+    mov r9, GLYPH_H
+.rows_ok:
 
     xor r10d, r10d
 
 .row:
-    cmp r10d, 8
+    cmp r10, r9
     je .done
 
-    mov al, [rsi + r10]
-    mov r11d, 8
+    mov bl, [rsi + r10]
+    xor r11d, r11d      
 
 .col:
-    test al, 0x80
+    cmp r11, r15
+    je .next_row
+
+    test bl, 0x80
     jz .skip
 
     mov rdx, r13
     add rdx, r10
-    imul rdx, rbx
-    add rdx, r12
+    imul rdx, r8
 
-    mov rcx, 8
-    sub rcx, r11
+    mov rcx, r11
+    add rcx, r12
     add rdx, rcx
 
     mov dword [rdi + rdx * 4], r14d
 
 .skip:
-    shl al, 1
-    dec r11d
-    jnz .col
+    shl bl, 1
+    inc r11d
+    jmp .col
 
+.next_row:
     inc r10d
     jmp .row
 
-.empty:
 .done:
+    pop r15
     pop r14
     pop r13
     pop r12
+    pop rdi
     pop rsi
     pop rbx
     ret
@@ -623,6 +808,7 @@ fail:
 
 section .data
 
+align 16
 guid:
     dd 0x9042a9de
     dw 0x23dc
@@ -633,32 +819,39 @@ guid:
 gop:
     dq 0
 
-fb:
-    dq 0
-
-sl:
-    dd 0
-
 conin:
     dq 0
 
-cursor_x:
-    dq START_X
+bs:
+    dq 0
 
-cursor_y:
-    dq START_Y
+key_event:
+    dq 0
 
-cursor_state:
+event_array:
+    dq 0
+
+event_index:
+    dq 0
+
+events_ready:
     db 0
 
-cursor_timer:
-    dq CURSOR_DELAY
+margin_x:
+    dq START_X
 
-screen_width:
-    dq 0
-
-screen_height:
-    dq 0
+align 8
+video:
+istruc Video
+    at Video.fb,    dq 0
+    at Video.sl,    dq 0
+    at Video.w,     dq 0
+    at Video.h,     dq 0
+    at Video.fg,    dq 0x00FFFFFF
+    at Video.bg,    dq 0x00000000
+    at Video.cx,    dq START_X
+    at Video.cy,    dq START_Y
+iend
 
 msg:
     db "Custom OS Kernel",10
