@@ -14,6 +14,10 @@ global _e
 %define BS_WAIT_FOR_EVENT      96
 %define BS_STALL               248
 
+; Boot Services timer offsets
+%define BS_CREATE_EVENT        80
+%define BS_SET_TIMER           88
+
 ; GOP offsets
 %define GOP_MODE               24
 %define M_INF                  8
@@ -43,6 +47,15 @@ global _e
 
 ; UEFI scan code compatibility
 %define EFI_SCAN_DELETE        8
+
+; UEFI event/timer
+%define EVT_TIMER              0x80000000
+%define TIMER_PERIODIC         1
+
+; Cursor
+%define CURSOR_BLINK_100NS     5000000       
+%define CURSOR_BLINK_MS        500           
+%define CURSOR_COLOR           0x00CCCCCC
 
 struc Video
     .fb:        resq 1
@@ -163,10 +176,18 @@ _e:
 
     call keyboard_init
 
+    ;================ cursor init =================
+
+    call cursor_draw
+
     ;================ start key loop =================
 
     call key_event_init
     cmp byte [events_ready], 1
+    jne .busy_loop
+
+    call timer_event_init
+    cmp byte [timer_ready], 1
     je .event_loop
 
 ;================ fallback busy loop =================
@@ -177,24 +198,48 @@ _e:
     jz .busy_tick
 
     call process_key
-    jmp .busy_loop
+    call cursor_draw
 
+    mov dword [blink_counter],0
+    jmp .busy_loop
+ 
 .busy_tick:
     call stall_1ms
+
+    inc dword [blink_counter]
+    cmp dword [blink_counter], CURSOR_BLINK_MS
+    jb .busy_loop
+
+    mov dword [blink_counter], 0
+    call cursor_toggle
     jmp .busy_loop
 
-;================ event-based key loop =================
+;================ event-based key/timer loop =================
 
 .event_loop:
-    call wait_key_event
-    test rax, rax
-    jnz .busy_loop
+    call wait_event
 
+    cmp eax, 0
+    je .event_key
+
+    cmp eax, 1
+    je .event_timer
+
+    jmp .busy_loop
+
+.event_key:
     call keyboard_get
     test al, al
     jz .event_loop
 
     call process_key
+    call cursor_draw
+
+    call timer_restart
+    jmp .event_loop
+
+.event_timer:
+    call cursor_toggle
     jmp .event_loop
 
 ;================ key processing =================
@@ -406,25 +451,29 @@ draw_text:
 ;================ edit =================
 
 backspace:
-    mov rax, [margin_x]
-    cmp qword [video + Video.cx], rax
+    mov rax,[margin_x]
+    cmp qword [video + Video.cx],rax
     jle .done
 
-    sub qword [video + Video.cx], CHAR_W
+    call cursor_erase
 
-    mov rcx, [video + Video.cx]
-    mov rdx, [video + Video.cy]
-    mov r8d, CHAR_W
-    mov r9d, CHAR_H
+    sub qword [video + Video.cx],CHAR_W
+
+    mov rcx,[video + Video.cx]
+    mov rdx,[video + Video.cy]
+    mov r8,CHAR_W
+    mov r9,CHAR_H
     call fill_rect_bg
 
 .done:
     ret
 
+
 newline:
-    mov rax, [margin_x]
-    mov [video + Video.cx], rax
-    add qword [video + Video.cy], CHAR_H
+    call cursor_erase
+    mov rax,[margin_x]
+    mov [video + Video.cx],rax
+    add qword [video + Video.cy],CHAR_H
     call ensure_y
     ret
 
@@ -459,6 +508,7 @@ fill_rect:
     push rbx
     push rdi
     push rsi
+    push r12
 
     test r8, r8
     jz .done
@@ -522,6 +572,7 @@ fill_rect:
     jnz .y
 
 .done:
+    pop r12
     pop rsi
     pop rdi
     pop rbx
@@ -531,6 +582,74 @@ fill_rect_bg:
     mov r10d, [video + Video.bg]
     call fill_rect
     ret
+
+;================ cursor =================
+
+cursor_draw:
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp,8
+
+    mov rax,[video + Video.cx]
+    mov [cursor_x],rax
+
+    mov rax,[video + Video.cy]
+    mov [cursor_y],rax
+
+    mov rcx,[cursor_x]
+    mov rdx,[cursor_y]
+    mov r8,CHAR_W
+    mov r9,CHAR_H
+    mov r10d,CURSOR_COLOR
+
+    call fill_rect
+
+    mov byte [cursor_shown],1
+
+    add rsp,8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+    
+cursor_erase:
+    cmp byte [cursor_shown],0
+    je .done
+
+    push rcx
+    push rdx
+    push r8
+    push r9
+
+    mov rcx,[video + Video.cx]
+    mov rdx,[video + Video.cy]
+    mov r8,CHAR_W
+    mov r9,CHAR_H
+    call fill_rect_bg
+
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+
+    mov byte [cursor_shown],0
+
+.done:
+    ret
+
+cursor_toggle:
+    cmp byte [cursor_shown], 0
+    je cursor_draw
+    jmp cursor_erase
 
 ;================ keyboard =================
 
@@ -580,7 +699,6 @@ keyboard_poll:
 
     test rax, rax
     jnz .nokey
-
 
     movzx ecx, word [rsp + 32]
     movzx eax, word [rsp + 34]
@@ -652,29 +770,156 @@ key_event_init:
 .fail:
     ret
 
-wait_key_event:
+timer_event_init:
+    push rbx
+    push r12
+
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 48
+
+    mov byte [timer_ready], 0
+
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .fail
+
+    mov rax, [rbx + BS_CREATE_EVENT]
+    test rax, rax
+    jz .fail
+
+    mov ecx, EVT_TIMER
+    xor edx, edx           
+    xor r8d, r8d           
+    xor r9d, r9d           
+
+    lea r10, [timer_event]
+    mov [rsp + 32], r10     
+
+    call rax
+    test rax, rax
+    jnz .fail
+
+    mov rbx, [bs]
+    mov rax, [rbx + BS_SET_TIMER]
+    test rax, rax
+    jz .fail
+
+    mov rcx, [timer_event]
+    test rcx, rcx
+    jz .fail
+
+    mov edx, TIMER_PERIODIC
+    mov r8, CURSOR_BLINK_100NS
+
+    call rax
+    test rax, rax
+    jnz .fail
+
+    mov rax, [timer_event]
+    mov [event_array + 8], rax
+    mov byte [timer_ready], 1
+
+.fail:
+    mov rsp, r12
+    pop r12
+    pop rbx
+    ret
+
+
+wait_event:
     push r12
     mov r12, rsp
     and rsp, -16
     sub rsp, 32
 
-    mov rcx, 1
-    lea rdx, [event_array]
-    lea r8, [event_index]
-
     mov rax, [bs]
     test rax, rax
     jz .error
 
+    cmp byte [events_ready], 1
+    jne .error
+
+    lea rdx, [event_array]
+    lea r8, [event_index]
+
+    cmp byte [timer_ready], 1
+    jne .one_event
+
+    mov rcx, 2
     call qword [rax + BS_WAIT_FOR_EVENT]
+    test rax, rax
+    jnz .error
+
+    mov rax, [event_index]
+
+    cmp rax, 1
+    je .timer
+
+    test rax, rax
+    jz .key
+
+    jmp .error
+
+.one_event:
+    mov rcx, 1
+    call qword [rax + BS_WAIT_FOR_EVENT]
+    test rax, rax
+    jnz .error
+
+.key:
+    xor eax, eax
+    jmp .done
+
+.timer:
+    mov eax, 1
     jmp .done
 
 .error:
-    mov eax, 1
+    mov eax, 2
 
 .done:
     mov rsp, r12
     pop r12
+    ret
+
+timer_restart:
+    cmp byte [timer_ready], 1
+    jne .done
+
+    push r12
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov rax, [bs]
+    test rax, rax
+    jz .pop
+
+    mov rax, [rax + BS_SET_TIMER]
+    test rax, rax
+    jz .pop
+
+    mov rcx, [timer_event]
+    xor edx, edx            
+    xor r8d, r8d
+    call rax
+
+    mov rax, [bs]
+    mov rax, [rax + BS_SET_TIMER]
+    test rax, rax
+    jz .pop
+
+    mov rcx, [timer_event]
+    mov edx, TIMER_PERIODIC
+    mov r8, CURSOR_BLINK_100NS
+    call rax
+
+.pop:
+    mov rsp, r12
+    pop r12
+
+.done:
     ret
 
 stall_1ms:
@@ -683,7 +928,7 @@ stall_1ms:
     and rsp, -16
     sub rsp, 32
 
-    mov rcx, 1000        
+    mov rcx, 1000
 
     mov rax, [bs]
     test rax, rax
@@ -707,8 +952,8 @@ draw_char:
     push r14
     push r15
 
-    mov r12, rcx        
-    mov r13, rdx        
+    mov r12, rcx
+    mov r13, rdx
     mov r14d, r8d
     movzx eax, r9b
 
@@ -755,7 +1000,7 @@ draw_char:
     je .done
 
     mov bl, [rsi + r10]
-    xor r11d, r11d      
+    xor r11d, r11d
 
 .col:
     cmp r11, r15
@@ -829,7 +1074,7 @@ key_event:
     dq 0
 
 event_array:
-    dq 0
+    dq 0, 0
 
 event_index:
     dq 0
@@ -837,8 +1082,22 @@ event_index:
 events_ready:
     db 0
 
+align 8
 margin_x:
     dq START_X
+
+timer_event:
+    dq 0
+
+timer_ready:
+    db 0
+
+cursor_shown:
+    db 0
+
+align 4
+blink_counter:
+    dd 0
 
 align 8
 video:
@@ -853,8 +1112,14 @@ istruc Video
     at Video.cy,    dq START_Y
 iend
 
+cursor_x:
+    dq 0
+
+cursor_y:
+    dq 0
+
 msg:
-    db "Custom OS Kernel",10
+    db "0xDEAD OS",10
     db "Framebuffer Text System",10
     db ">",0
 
