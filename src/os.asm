@@ -507,73 +507,89 @@ ensure_y:
 fill_rect:
     push rbx
     push rdi
-    push rsi
     push r12
 
-    test r8, r8
+    ; width/height = 0
+    test r8,r8
     jz .done
-    test r9, r9
+    test r9,r9
     jz .done
 
-    mov rax, [video + Video.w]
-    cmp rcx, rax
+    ; clip X
+    mov rax,[video + Video.w]
+
+    cmp rcx,rax
     jae .done
 
-    mov r11, rcx
-    add r11, r8
-    cmp r11, rax
-    jbe .w_ok
-    mov r8, rax
-    sub r8, rcx
-.w_ok:
+    mov r12,rcx
+    add r12,r8
 
-    mov rax, [video + Video.h]
-    cmp rdx, rax
+    cmp r12,rax
+    jbe .x_ok
+
+    sub rax,rcx
+    mov r8,rax
+
+.x_ok:
+
+
+    ; clip Y
+    mov rax,[video + Video.h]
+
+    cmp rdx,rax
     jae .done
 
-    mov r11, rdx
-    add r11, r9
-    cmp r11, rax
-    jbe .h_ok
-    mov r9, rax
-    sub r9, rdx
-.h_ok:
+    mov r12,rdx
+    add r12,r9
 
-    test r8, r8
+    cmp r12,rax
+    jbe .y_ok
+
+    sub rax,rdx
+    mov r9,rax
+
+.y_ok:
+
+    test r8,r8
     jz .done
-    test r9, r9
+    test r9,r9
     jz .done
 
-    mov rdi, [video + Video.fb]
-    mov rbx, [video + Video.sl]
 
-    mov r11, rdx
-    imul r11, rbx
-    add r11, rcx
-    shl r11, 2
+    ; framebuffer base
+    mov rdi,[video + Video.fb]
 
-.y:
-    push r9
-    mov rsi, r8
 
-.x:
-    mov dword [rdi + r11], r10d
-    add r11, 4
-    dec rsi
-    jnz .x
+    ; offset = (y*stride+x)*4
+    mov rax,[video + Video.sl]
+    imul rax,rdx
+    add rax,rcx
+    shl rax,2
 
-    mov rax, [video + Video.sl]
-    sub rax, r8
-    shl rax, 2
-    add r11, rax
+    add rdi,rax
 
-    pop r9
+
+    ; bytes after each line
+    mov rbx,[video + Video.sl]
+    sub rbx,r8
+    shl rbx,2
+
+
+.row:
+
+    mov eax,r10d
+    mov rcx,r8
+    rep stosd
+
+
+    add rdi,rbx
+
     dec r9
-    jnz .y
+    jnz .row
+
 
 .done:
     pop r12
-    pop rsi
     pop rdi
     pop rbx
     ret
@@ -944,6 +960,7 @@ stall_1ms:
 ;================ char =================
 
 draw_char:
+
     push rbx
     push rsi
     push rdi
@@ -952,83 +969,101 @@ draw_char:
     push r14
     push r15
 
-    mov r12, rcx
-    mov r13, rdx
-    mov r14d, r8d
-    movzx eax, r9b
 
-    cmp eax, KEY_SPACE
+    mov r12,rcx        ; x
+    mov r13,rdx        ; y
+    mov r14d,r8d       ; color
+
+
+    movzx eax,r9b
+
+    cmp eax,KEY_SPACE
     jb .done
-    cmp eax, KEY_DELETE
+
+    cmp eax,KEY_DELETE
     ja .done
 
-    mov r15, [video + Video.w]
-    cmp r12, r15
-    jae .done
 
-    mov r15, [video + Video.h]
-    cmp r13, r15
-    jae .done
+    sub eax,KEY_SPACE
+    shl eax,3
 
-    sub eax, KEY_SPACE
-    shl eax, 3
+    lea rsi,[font_table]
+    add rsi,rax
 
-    lea rsi, [font_table]
-    add rsi, rax
 
-    mov rdi, [video + Video.fb]
-    mov r8, [video + Video.sl]
 
-    mov r15, [video + Video.w]
-    sub r15, r12
-    cmp r15, GLYPH_W
-    jbe .cols_ok
-    mov r15, GLYPH_W
-.cols_ok:
+    mov rdi,[video + Video.fb]
 
-    mov r9, [video + Video.h]
-    sub r9, r13
-    cmp r9, GLYPH_H
-    jbe .rows_ok
-    mov r9, GLYPH_H
-.rows_ok:
+    mov r15,[video + Video.sl]
 
-    xor r10d, r10d
+    ; byte pitch
+    shl r15,2
+
+
+    ; start pixel offset
+    mov rax,r13
+    mov rdx,r15
+    imul rax,rdx
+
+    mov rdx,r12
+    shl rdx,2
+
+    add rax,rdx
+
+    add rdi,rax
+
+
+
+    xor r10d,r10d
+
 
 .row:
-    cmp r10, r9
-    je .done
 
-    mov bl, [rsi + r10]
-    xor r11d, r11d
+    cmp r10d,GLYPH_H
+    jae .done
+
+
+    mov bl,[rsi+r10]
+
+
+    xor r11d,r11d
+
 
 .col:
-    cmp r11, r15
-    je .next_row
 
-    test bl, 0x80
+    cmp r11d,GLYPH_W
+    jae .next_row
+
+
+    test bl,80h
     jz .skip
 
-    mov rdx, r13
-    add rdx, r10
-    imul rdx, r8
 
-    mov rcx, r11
-    add rcx, r12
-    add rdx, rcx
+    mov eax,r14d
+    mov [rdi+r11*4],eax
 
-    mov dword [rdi + rdx * 4], r14d
 
 .skip:
-    shl bl, 1
+
+    shl bl,1
+
     inc r11d
     jmp .col
 
+
+
 .next_row:
+
+    add rdi,r15
+
     inc r10d
+
     jmp .row
 
+
+
 .done:
+
     pop r15
     pop r14
     pop r13
@@ -1036,8 +1071,8 @@ draw_char:
     pop rdi
     pop rsi
     pop rbx
-    ret
 
+    ret
 ;================ fail =================
 
 fail:
