@@ -74,17 +74,10 @@ global _e
 
 %define EFI_LOADER_DATA        2
 
-; Usable memory types:
-;   3 = EfiBootServicesCode
-;   4 = EfiBootServicesData
-;   7 = EfiConventionalMemory
 %define MEM_TYPE_BS_CODE       3
 %define MEM_TYPE_BS_DATA       4
 %define MEM_TYPE_CONVENTIONAL  7
 
-; Debug-friendly limit:
-; 0x200000 pages = 2,097,152 pages = 8 GiB
-; Bitmap size = 256 KiB
 %define PMM_MAX_PAGES          0x200000
 %define PMM_BITMAP_SIZE        (PMM_MAX_PAGES / 8)
 
@@ -108,6 +101,8 @@ global _e
     shr %1, 12
     and %1, -4096
 %endmacro
+
+%define CMD_MAX 64
 
 %macro FAIL_CODE 1
     mov al, %1
@@ -151,8 +146,8 @@ _e:
     and rsp, -16
     sub rsp, 32
 
-    mov r12, rdx
     mov [image_handle], rcx
+    mov r12, rdx
 
     mov rax, [r12 + ST_CONIN_OFFSET]
     mov [conin], rax
@@ -281,8 +276,7 @@ _e:
 
     call mem_init
 
-    ;================ vmm stage 1 =================
-    ; Build page tables, but do NOT activate CR3 yet.
+    ;================ vmm build =================
 
     lea r9, [msg_vmm_build]
     call draw_text
@@ -300,74 +294,48 @@ _e:
 
     call cursor_draw
 
-    ;================ events before CR3 =================
-    ; Create UEFI events before switching page tables.
+    ;================ events =================
 
     call key_event_init
     call timer_event_init
 
-    ;================ vmm stage 2 =================
-    ; Activate CR3.
+    ;================ vmm activate =================
 
     lea r9, [msg_vmm_activate]
     call draw_text
 
     call vmm_activate
+    mov byte [vmm_active], 1
 
     lea r9, [msg_vmm_active]
     call draw_text
 
-    ;================ choose loop =================
+    ;================ minimal IDT =================
 
-    mov dword [blink_counter], 0
-
-    cmp byte [events_ready], 1
-    jne .use_busy_loop
-
-    cmp byte [timer_ready], 1
-    jne .use_busy_loop
-
-    lea r9, [msg_events_ready]
-    call draw_text
-
-    jmp .prepare_idt
-
-.use_busy_loop:
-    lea r9, [msg_events_busy]
-    call draw_text
-
-.prepare_idt:
     call idt_init_minimal
 
     lea r9, [msg_idt_ok]
     call draw_text
 
+    lea r9, [msg_shell_hint]
+    call draw_text
+
+    lea r9, [prompt_str]
+    call draw_text
+
     call cursor_draw
     mov dword [blink_counter], 0
 
-    ;================ stage 5: exit boot services test =================
+    ;================ start key loop =================
 
-    lea r9, [msg_press_key_exit]
-    call draw_text
+    cmp byte [events_ready], 1
+    jne .busy_loop
 
-    call cursor_draw
+    cmp byte [timer_ready], 1
+    je .event_loop
 
-    call wait_one_key
+    jmp .busy_loop
 
-    call cursor_erase
-
-    lea r9, [msg_exitbs]
-    call draw_text
-
-    call exit_boot_services
-
-    lea r9, [msg_exitbs_ok]
-    call draw_text
-
-.halt_after_exit:
-    cli
-    hlt
-    jmp .halt_after_exit
 ;================ fallback busy loop =================
 
 .busy_loop:
@@ -420,7 +388,7 @@ _e:
     call cursor_toggle
     jmp .event_loop
 
-;================ key processing =================
+;================ key processing / mini shell input =================
 
 process_key:
     sub rsp, 8
@@ -429,20 +397,27 @@ process_key:
     je .backspace
 
     cmp al, KEY_ENTER
-    je .newline
+    je .enter
 
-    mov r9b, al
-    call console_putc
+    cmp al, CHAR_TAB
+    je .ignore
+
+    call cmd_append_char
+
     add rsp, 8
     ret
 
 .backspace:
-    call backspace
+    call cmd_backspace
     add rsp, 8
     ret
 
-.newline:
-    call newline
+.enter:
+    call cmd_enter
+    add rsp, 8
+    ret
+
+.ignore:
     add rsp, 8
     ret
 
@@ -1270,21 +1245,6 @@ mem_init:
     call pmm_init
     ret
 
-;================================================
-; get_memory_map
-;
-; Diagnostic error codes:
-;   1 = bs null
-;   2 = GetMemoryMap pointer null
-;   3 = first GetMemoryMap failed
-;   4 = first GetMemoryMap returned size 0
-;   5 = AllocatePool failed
-;   6 = AllocatePool returned NULL buffer
-;   7 = GetMemoryMap pointer null after AllocatePool
-;   8 = second GetMemoryMap failed
-;   9 = retry limit exceeded
-;================================================
-
 get_memory_map:
     push rbx
     push r12
@@ -1303,14 +1263,12 @@ get_memory_map:
     test r13, r13
     jz .err_gmm_ptr
 
-    xor r14, r14                 ; retry counter
+    xor r14, r14
 
 .retry:
     mov qword [mm_tmp_size], 0
     mov qword [mm_tmp_buffer], 0
 
-    ; First call:
-    ; ask UEFI for required memory map buffer size.
     lea rcx, [mm_tmp_size]
     xor edx, edx
     lea r8, [mm_tmp_key]
@@ -1319,7 +1277,6 @@ get_memory_map:
     mov [rsp + 32], r10
     call r13
 
-    ; Some firmwares may return plain 5, others return EFIERR(5).
     cmp rax, 5
     je .allocate
 
@@ -1334,19 +1291,17 @@ get_memory_map:
     je .err_size
 
 .allocate:
-    ; Add slack because AllocatePool may change the map.
     mov rdx, [mm_tmp_desc_size]
     test rdx, rdx
     jnz .desc_ok
     mov rdx, 48
 
 .desc_ok:
-    shl rdx, 4                   ; space for 16 extra descriptors
-    add rdx, 4096                ; one extra page
+    shl rdx, 4
+    add rdx, 4096
     add rdx, [mm_tmp_size]
     mov [mm_tmp_size], rdx
 
-    ; AllocatePool(EfiLoaderData, Size, &Buffer)
     mov ecx, EFI_LOADER_DATA
     mov rdx, [mm_tmp_size]
     lea r8, [mm_tmp_buffer]
@@ -1363,13 +1318,10 @@ get_memory_map:
     test rdx, rdx
     jz .err_buf
 
-    ; Reload GetMemoryMap pointer just in case AllocatePool clobbered r13
     mov r13, [rbx + BS_GET_MEMORY_MAP]
     test r13, r13
     jz .err_gmm_ptr2
 
-    ; Second call:
-    ; actually get the memory map.
     lea rcx, [mm_tmp_size]
     mov rdx, [mm_tmp_buffer]
     lea r8, [mm_tmp_key]
@@ -1389,7 +1341,6 @@ get_memory_map:
     jne .err_second
 
 .retry_path:
-    ; Map grew again. Free old buffer and retry.
     mov rcx, [mm_tmp_buffer]
     test rcx, rcx
     jz .retry_no_free
@@ -1453,18 +1404,6 @@ get_memory_map:
 .err_second:
     FAIL_CODE '8'
 
-;================================================
-; pmm_init
-;
-; Diagnostic error codes:
-;   A = mem_map null
-;   B = mem_size zero
-;   C = desc_size zero
-;   D = desc_size too small
-;   E = no managed pages found
-;   G = no free pages found
-;================================================
-
 pmm_init:
     push rbx
     push r12
@@ -1493,27 +1432,21 @@ pmm_init:
     test rbx, rbx
     jz .err_desc
 
-    ; OVMF/QEMU may return 40 or 48.
-    ; We only access up to offset 32, so 40 is safe.
     cmp rbx, 40
     jb .err_desc_small
 
-    ; Mark all pages used initially.
     cld
     mov eax, 0xFF
     mov rcx, PMM_BITMAP_SIZE
     rep stosb
 
-    xor r12, r12                 ; highest managed page index
-    xor r13, r13                 ; free page count
+    xor r12, r12
+    xor r13, r13
 
 .loop:
     cmp r15, rbx
     jb .finish
 
-    ; Stage 1 VMM safety:
-    ; Only EfiConventionalMemory is safely allocatable before
-    ; ExitBootServices when we actually allocate page-table pages.
     mov eax, [r14]
     cmp eax, MEM_TYPE_CONVENTIONAL
     je .usable
@@ -1521,10 +1454,6 @@ pmm_init:
     jmp .next
 
 .usable:
-    ; EFI_MEMORY_DESCRIPTOR offsets:
-    ;   +0  Type
-    ;   +8  PhysicalStart
-    ;   +24 NumberOfPages
     mov rax, [r14 + 8]
     mov r8, [r14 + 24]
 
@@ -1532,12 +1461,11 @@ pmm_init:
     jz .next
 
     mov r9, rax
-    shr r9, PAGE_SHIFT           ; start page index
+    shr r9, PAGE_SHIFT
 
     cmp r9, PMM_MAX_PAGES
     jae .next
 
-    ; end page index = start + pages
     mov r10, r9
     add r10, r8
     jc .cap_max
@@ -1549,8 +1477,6 @@ pmm_init:
     mov r10, PMM_MAX_PAGES
 
 .cap_ok:
-    ; Reserve physical page 0.
-    ; pmm_alloc_page returns 0 on failure.
     cmp r9, 1
     jae .start_ok
     mov r9, 1
@@ -1568,7 +1494,6 @@ pmm_init:
     sub rax, r9
     add r13, rax
 
-    ; Mark page range [r9, r10) as free.
     mov rcx, r9
     mov rdx, r10
     call pmm_clear_range
@@ -1615,18 +1540,6 @@ pmm_init:
 
 .err_free:
     FAIL_CODE 'G'
-
-;================================================
-; pmm_clear_range
-;
-; Internal PMM helper.
-;
-; Input:
-;   rcx = start page index
-;   rdx = end page index, exclusive
-;
-; Clears bitmap bits for the given page range.
-;================================================
 
 pmm_clear_range:
     cmp rcx, rdx
@@ -1688,16 +1601,6 @@ pmm_clear_range:
 .done:
     ret
 
-;================================================
-; pmm_alloc_page
-;
-; Allocates one free 4 KiB physical page.
-;
-; Output:
-;   rax = physical address
-;   rax = 0 on failure
-;================================================
-
 pmm_alloc_page:
     xor eax, eax
 
@@ -1712,7 +1615,6 @@ pmm_alloc_page:
     test r8, r8
     je .done
 
-    ; end_word = (total_pages + 63) / 64
     lea r9, [r8 + 63]
     shr r9, 6
 
@@ -1753,10 +1655,8 @@ pmm_alloc_page:
     jmp .scan_second
 
 .found:
-    ; rax = mask of free bits in this bitmap word
     bsf rax, rax
 
-    ; page index = word_index * 64 + bit_index
     mov r11, rdx
     shl r11, 6
     add r11, rax
@@ -1764,7 +1664,6 @@ pmm_alloc_page:
     cmp r11, r8
     jae .none
 
-    ; Mark page as used.
     mov rcx, r11
     shr rcx, 6
 
@@ -1774,7 +1673,6 @@ pmm_alloc_page:
 
     dec qword [boot_info + BootInfo.pmm_free_pages]
 
-    ; If this bitmap word is now full, start next search at next word.
     mov rax, [r10 + rcx*8]
     cmp rax, -1
     jne .next_ok
@@ -1792,18 +1690,6 @@ pmm_alloc_page:
 
 .done:
     ret
-
-;================================================
-; pmm_free_page
-;
-; Frees one 4 KiB physical page.
-;
-; Input:
-;   rcx = physical address
-;
-; The address must be page-aligned and inside the
-; managed physical range.
-;================================================
 
 pmm_free_page:
     test rcx, rcx
@@ -1828,33 +1714,18 @@ pmm_free_page:
     mov r8, rdx
     and r8, 63
 
-    ; If already free, ignore.
     bt qword [r10 + r11*8], r8
     jnc .done
 
     btr qword [r10 + r11*8], r8
     inc qword [boot_info + BootInfo.pmm_free_pages]
 
-    ; Freeing an earlier page can speed up future allocations.
     cmp r11, [pmm_next_word]
     jae .done
     mov [pmm_next_word], r11
 
 .done:
     ret
-
-;================================================
-; mem_alloc
-;
-; Future heap replacement point.
-;
-; Temporary PMM-backed behavior:
-;   rcx = requested size in bytes
-;   rax = allocated address, or 0 on failure
-;
-; Currently only supports allocations up to one
-; 4 KiB page.
-;================================================
 
 mem_alloc:
     test rcx, rcx
@@ -1868,15 +1739,6 @@ mem_alloc:
 .fail:
     xor eax, eax
     ret
-
-;================================================
-; mem_free
-;
-; Future heap replacement point.
-;
-; Temporary PMM-backed behavior:
-;   rcx = address returned by mem_alloc
-;================================================
 
 mem_free:
     jmp pmm_free_page
@@ -1905,14 +1767,14 @@ vmm_map_2mb:
     push r13
     push r14
 
-    mov r12, rcx        ; physical/virtual address
-    mov r13, rdx        ; extra flags
+    mov r12, rcx
+    mov r13, rdx
 
     mov rbx, [pml4_ptr]
     test rbx, rbx
     jz .oom
 
-    ; ---- PML4 -> PDPT ----
+    ; PML4 -> PDPT
     mov rax, r12
     shr rax, 39
     and eax, PT_INDEX_BITS
@@ -1937,7 +1799,7 @@ vmm_map_2mb:
     MASK_FRAME rax
     mov rbx, rax
 
-    ; ---- PDPT -> PD ----
+    ; PDPT -> PD
     mov rax, r12
     shr rax, 30
     and eax, PT_INDEX_BITS
@@ -1962,7 +1824,7 @@ vmm_map_2mb:
     MASK_FRAME rax
     mov rbx, rax
 
-    ; ---- install 2MB page ----
+    ; install 2MB page
     mov rax, r12
     shr rax, 21
     and eax, PT_INDEX_BITS
@@ -2003,7 +1865,6 @@ vmm_build:
     push r12
     push r13
 
-    ; Allocate PML4 page
     call pmm_alloc_page
     test rax, rax
     jz .oom
@@ -2012,12 +1873,10 @@ vmm_build:
     mov rcx, rax
     call zero_page
 
-    ; ---- compute identity-map ceiling ----
     mov rax, PMM_MAX_PAGES
     shl rax, PAGE_SHIFT
     mov r12, rax
 
-    ; Also map enough of the framebuffer.
     mov rax, [video + Video.sl]
     mov rdx, [video + Video.h]
     imul rax, rdx
@@ -2032,7 +1891,6 @@ vmm_build:
     mov r12, rax
 .ceiling_ok:
 
-    ; ---- map [0, ceiling) in 2MB steps ----
     xor r13, r13
 
 .map_loop:
@@ -2077,6 +1935,7 @@ vmm_activate:
 
 .done:
     ret
+
 ;================ minimal idt / exceptions =================
 
 %macro ISR_NOERR 1
@@ -2167,10 +2026,6 @@ isr_stub_table:
 isr_common:
     cli
 
-    ; stack layout from stub:
-    ; [rsp]     vector
-    ; [rsp + 8] error code
-    ; [rsp + 16] rip
     mov rcx, [rsp]
     mov rdx, [rsp + 8]
     mov r8, [rsp + 16]
@@ -2267,16 +2122,13 @@ idt_init_minimal:
 
     cld
 
-    ; Save current IDTR
     sidt [old_idtr_limit]
 
-    ; Zero our IDT
     lea rdi, [idt]
     xor eax, eax
     mov rcx, (256 * 16) / 8
     rep stosq
 
-    ; Copy old IDT, if present
     movzx ecx, word [old_idtr_limit]
     inc rcx
 
@@ -2294,7 +2146,6 @@ idt_init_minimal:
     rep movsb
 
 .no_copy:
-    ; Use current CS, no new GDT yet.
     mov ax, cs
     movzx r12, ax
 
@@ -2310,22 +2161,13 @@ idt_init_minimal:
     imul rcx, 16
     add rdi, rcx
 
-    ; IDT entry:
-    ; offset_low  0
-    ; selector    2
-    ; ist         4
-    ; type_attr   5
-    ; offset_mid  6
-    ; offset_high 8
-    ; reserved    12
-
-    mov [rdi + 0], ax
+    mov word [rdi + 0], ax
     mov word [rdi + 2], r12w
     mov byte [rdi + 4], 0
     mov byte [rdi + 5], 0x8E
 
     shr rax, 16
-    mov [rdi + 6], ax
+    mov word [rdi + 6], ax
 
     shr rax, 16
     mov dword [rdi + 8], eax
@@ -2334,6 +2176,9 @@ idt_init_minimal:
     inc r13
     cmp r13, 32
     jb .fill_loop
+
+    lea rax, [idt]
+    mov [new_idtr_base], rax
 
     lidt [new_idtr_limit]
 
@@ -2344,25 +2189,204 @@ idt_init_minimal:
     pop rbx
     ret
 
-wait_one_key:
-.wait:
-    call keyboard_get
-    test al, al
-    jnz .done
+;================ mini shell =================
 
-    call stall_1ms
-    jmp .wait
+cmd_append_char:
+    push rdi
+    push rcx
+
+    mov rcx, [cmd_len]
+    cmp rcx, CMD_MAX - 1
+    jae .done
+
+    lea rdi, [cmd_buf]
+    mov [rdi + rcx], al
+    inc qword [cmd_len]
+
+    mov r9b, al
+    call console_putc
+
+.done:
+    pop rcx
+    pop rdi
+    ret
+
+cmd_backspace:
+    cmp qword [cmd_len], 0
+    je .done
+
+    dec qword [cmd_len]
+
+    mov rcx, [cmd_len]
+    lea rdi, [cmd_buf]
+    mov byte [rdi + rcx], 0
+
+    call backspace
 
 .done:
     ret
-;================================================
-; exit_boot_services
-;
-; Diagnostic error codes:
-;   X = ExitBootServices failed after retries
-;   Y = Boot Services pointer null
-;   Z = ExitBootServices pointer null
-;================================================
+
+cmd_enter:
+    push rdi
+    push rcx
+
+    mov rcx, [cmd_len]
+    lea rdi, [cmd_buf]
+    mov byte [rdi + rcx], 0
+
+    call cmd_execute
+
+    mov qword [cmd_len], 0
+
+    pop rcx
+    pop rdi
+
+    call newline
+
+    lea r9, [prompt_str]
+    call draw_text
+
+    ret
+
+cmd_is:
+    ; input: rsi = command string
+    ; output: eax = 1 if equal, else 0
+
+    push rsi
+    push rdi
+
+    lea rdi, [cmd_buf]
+
+.loop:
+    mov al, [rsi]
+    mov dl, [rdi]
+
+    cmp al, dl
+    jne .no
+
+    test al, al
+    jz .yes
+
+    inc rsi
+    inc rdi
+    jmp .loop
+
+.yes:
+    pop rdi
+    pop rsi
+    mov eax, 1
+    ret
+
+.no:
+    pop rdi
+    pop rsi
+    xor eax, eax
+    ret
+
+cmd_execute:
+    cmp qword [cmd_len], 0
+    je .done
+
+    lea rsi, [str_cmd_help]
+    call cmd_is
+    test eax, eax
+    jnz .help
+
+    lea rsi, [str_cmd_clear]
+    call cmd_is
+    test eax, eax
+    jnz .clear
+
+    lea rsi, [str_cmd_mem]
+    call cmd_is
+    test eax, eax
+    jnz .mem
+
+    lea rsi, [str_cmd_vmm]
+    call cmd_is
+    test eax, eax
+    jnz .vmm
+
+    lea rsi, [str_cmd_exit]
+    call cmd_is
+    test eax, eax
+    jnz .exit
+
+    lea r9, [msg_unknown_cmd]
+    call draw_text
+    ret
+
+.help:
+    lea r9, [msg_help]
+    call draw_text
+    ret
+
+.clear:
+    call console_clear
+
+    mov rax, [margin_x]
+    mov [video + Video.cx], rax
+    mov qword [video + Video.cy], START_Y
+
+    call ensure_y
+    ret
+
+.mem:
+    lea r9, [str_mem_total]
+    call draw_text
+
+    mov rcx, [boot_info + BootInfo.pmm_total_pages]
+    call print_hex64
+
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_mem_free]
+    call draw_text
+
+    mov rcx, [boot_info + BootInfo.pmm_free_pages]
+    call print_hex64
+
+    mov r9b, CHAR_LF
+    call console_putc
+    ret
+
+.vmm:
+    cmp byte [vmm_active], 1
+    jne .vmm_inactive
+
+    lea r9, [str_vmm_active]
+    call draw_text
+    ret
+
+.vmm_inactive:
+    lea r9, [str_vmm_inactive]
+    call draw_text
+    ret
+
+.exit:
+    jmp exit_boot_services_sequence
+
+.done:
+    ret
+
+;================ exit boot services =================
+
+exit_boot_services_sequence:
+    call cursor_erase
+
+    lea r9, [msg_exitbs]
+    call draw_text
+
+    call exit_boot_services
+
+    lea r9, [msg_exitbs_ok]
+    call draw_text
+
+.halt:
+    cli
+    hlt
+    jmp .halt
 
 exit_boot_services:
     push rbx
@@ -2385,8 +2409,6 @@ exit_boot_services:
     xor r14, r14
 
 .retry:
-    ; Get a fresh memory map and map key immediately before
-    ; calling ExitBootServices.
     call get_memory_map
 
     mov rcx, [image_handle]
@@ -2418,6 +2440,7 @@ exit_boot_services:
     pop r12
     pop rbx
     ret
+
 ;================ fail =================
 
 fail:
@@ -2457,6 +2480,9 @@ conin:
 bs:
     dq 0
 
+image_handle:
+    dq 0
+
 key_event:
     dq 0
 
@@ -2485,6 +2511,9 @@ cursor_shown:
 align 4
 blink_counter:
     dd 0
+
+vmm_active:
+    db 0
 
 align 8
 video:
@@ -2533,22 +2562,73 @@ msg_vmm_build:
     db "VMM: building tables...",10,0
 
 msg_vmm_ok:
-    db "VMM: tables built (not activated)",10,0
-    
+    db "VMM: tables built",10,0
+
 msg_vmm_activate:
     db "VMM: activating CR3...",10,0
 
 msg_vmm_active:
     db "VMM: CR3 active",10,0
-    
-msg_events_ready:
-    db "Events: ready",10,0
 
-msg_events_busy:
-    db "Events: using busy loop",10,0
-    
 msg_idt_ok:
     db "IDT: installed",10,0
+
+msg_shell_hint:
+    db "Type 'help' for commands.",10,0
+
+msg_exitbs:
+    db "Exiting Boot Services...",10,0
+
+msg_exitbs_ok:
+    db "Boot services exited. System halted.",10,0
+
+prompt_str:
+    db ">",0
+
+cmd_buf:
+    times CMD_MAX db 0
+
+cmd_len:
+    dq 0
+
+str_cmd_help:
+    db "help",0
+
+str_cmd_clear:
+    db "clear",0
+
+str_cmd_mem:
+    db "mem",0
+
+str_cmd_vmm:
+    db "vmm",0
+
+str_cmd_exit:
+    db "exit",0
+
+msg_help:
+    db "Commands:",10
+    db "  help  - show this help",10
+    db "  clear - clear screen",10
+    db "  mem   - memory info",10
+    db "  vmm   - vmm status",10
+    db "  exit  - exit boot services",10
+    db 0
+
+msg_unknown_cmd:
+    db "Unknown command. Type 'help'.",10,0
+
+str_mem_total:
+    db "PMM total pages: 0x",0
+
+str_mem_free:
+    db "PMM free pages : 0x",0
+
+str_vmm_active:
+    db "VMM: active",10,0
+
+str_vmm_inactive:
+    db "VMM: inactive",10,0
 
 hex_digits:
     db "0123456789ABCDEF"
@@ -2568,33 +2648,6 @@ str_rip:
 str_halted:
     db 10,"System halted.",0
 
-align 16
-idt:
-    times 256 * 16 db 0
-
-align 16
-new_idtr_limit:
-    dw (256 * 16) - 1
-new_idtr_base:
-    dq idt
-
-old_idtr_limit:
-    dw 0
-old_idtr_base:
-    dq 0
-    
-align 8
-image_handle:
-    dq 0
-    
-msg_press_key_exit:
-    db "Press any key to exit Boot Services...",10,0
-
-msg_exitbs:
-    db "Exiting Boot Services...",10,0
-
-msg_exitbs_ok:
-    db "Boot services exited. System halted.",10,0
 ;================ fonts =================
 
 font_table:
@@ -2714,5 +2767,23 @@ pmm_next_word:        dq 0
 align 8
 pml4_ptr:             dq 0
 
+;================ idt data =================
+
+align 16
+idt:
+    times 256 * 16 db 0
+
+align 16
+new_idtr_limit:
+    dw (256 * 16) - 1
+new_idtr_base:
+    dq 0
+
+old_idtr_limit:
+    dw 0
+old_idtr_base:
+    dq 0
+
 align 4096
-pmm_bitmap:           times PMM_BITMAP_SIZE db 0
+pmm_bitmap:
+    times PMM_BITMAP_SIZE db 0
