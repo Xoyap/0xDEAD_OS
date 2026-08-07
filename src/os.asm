@@ -7,21 +7,29 @@ global _e
 
 ; System Table offsets
 %define ST_CONIN_OFFSET        0x30
-%define ST_BS                  96
-%define BS_LP                  0x140
+%define ST_BS                  0x60
 
-; Boot Services offsets
-%define BS_WAIT_FOR_EVENT      96
-%define BS_STALL               248
+; UEFI Boot Services offsets (x86_64)
+%define BS_GET_MEMORY_MAP      0x38
+%define BS_ALLOCATE_POOL       0x40
+%define BS_FREE_POOL           0x48
 
-; Boot Services timer offsets
-%define BS_CREATE_EVENT        80
-%define BS_SET_TIMER           88
+%define BS_CREATE_EVENT        0x50
+%define BS_SET_TIMER           0x58
+%define BS_WAIT_FOR_EVENT      0x60
+%define BS_SIGNAL_EVENT        0x68
+%define BS_CLOSE_EVENT         0x70
+%define BS_CHECK_EVENT         0x78
+
+%define BS_STALL               0xF8
+%define BS_SET_WATCHDOG_TIMER  0x100
+%define BS_LOCATE_PROTOCOL     0x140
 
 ; GOP offsets
 %define GOP_MODE               24
 %define M_INF                  8
 %define M_FB                   24
+
 %define I_HRES                 4
 %define I_VRES                 8
 %define I_SL                   32
@@ -51,39 +59,33 @@ global _e
 %define TIMER_PERIODIC         1
 
 ; Cursor
-%define CURSOR_BLINK_100NS     5000000       
-%define CURSOR_BLINK_MS        500           
+%define CURSOR_BLINK_100NS     5000000
+%define CURSOR_BLINK_MS        500
 %define CURSOR_COLOR           0x00CCCCCC
 
 ;================ memory defines =================
 
-%define PAGE_SHIFT              12
-%define PAGE_SIZE               4096
+%define PAGE_SHIFT             12
+%define PAGE_SIZE              4096
 
-%define EFI_SUCCESS             0
-%define EFI_BUFFER_TOO_SMALL    0x8000000000000005
+%define EFI_SUCCESS            0
+%define EFI_BUFFER_TOO_SMALL   0x8000000000000005
 
-%define BS_GET_MEMORY_MAP       56
-%define BS_ALLOCATE_POOL        64
-%define BS_FREE_POOL            72
-
-%define EFI_LOADER_DATA         2
+%define EFI_LOADER_DATA        2
 
 ; Usable memory types:
 ;   3 = EfiBootServicesCode
 ;   4 = EfiBootServicesData
 ;   7 = EfiConventionalMemory
-%define MEM_TYPE_BS_CODE        3
-%define MEM_TYPE_BS_DATA        4
-%define MEM_TYPE_CONVENTIONAL   7
+%define MEM_TYPE_BS_CODE       3
+%define MEM_TYPE_BS_DATA       4
+%define MEM_TYPE_CONVENTIONAL  7
 
 ; Debug-friendly limit:
 ; 0x200000 pages = 2,097,152 pages = 8 GiB
 ; Bitmap size = 256 KiB
-;
-; Later you can raise it back to 0x1000000 for 64 GiB.
-%define PMM_MAX_PAGES           0x200000
-%define PMM_BITMAP_SIZE         (PMM_MAX_PAGES / 8)
+%define PMM_MAX_PAGES          0x200000
+%define PMM_BITMAP_SIZE        (PMM_MAX_PAGES / 8)
 
 %macro FAIL_CODE 1
     mov al, %1
@@ -109,6 +111,7 @@ struc BootInfo
 
     .mem_map:           resq 1
     .mem_size:          resq 1
+    .mem_map_key:       resq 1
     .mem_desc_size:     resq 1
     .mem_desc_version:  resq 1
 
@@ -136,7 +139,20 @@ _e:
     jz fail
     mov [bs], rbx
 
-    mov rax, [rbx + BS_LP]
+    ; Disable UEFI watchdog timer.
+    mov rax, [rbx + BS_SET_WATCHDOG_TIMER]
+    test rax, rax
+    jz .watchdog_ok
+
+    xor ecx, ecx
+    xor edx, edx
+    xor r8d, r8d
+    xor r9d, r9d
+    call rax
+
+.watchdog_ok:
+    mov rbx, [bs]
+    mov rax, [rbx + BS_LOCATE_PROTOCOL]
     test rax, rax
     jz fail
 
@@ -201,6 +217,13 @@ _e:
     mov [video + Video.w], rax
 .width_ok:
 
+    ; Sanitize margin early.
+    mov rax, [video + Video.w]
+    cmp rax, START_X + CHAR_W
+    jae .margin_ok
+    mov qword [margin_x], 0
+.margin_ok:
+
     ;================ boot info =================
 
     mov rax, [video + Video.fb]
@@ -215,20 +238,12 @@ _e:
     mov rax, [video + Video.sl]
     mov [boot_info + BootInfo.stride], rax
 
-    ;================ init =================
-
-    call mem_init
+    ;================ early console =================
 
     mov qword [video + Video.fg], 0x00FFFFFF
     mov qword [video + Video.bg], 0x00000000
 
     call console_clear
-
-    mov rax, [video + Video.w]
-    cmp rax, START_X + CHAR_W
-    jae .margin_ok
-    mov qword [margin_x], 0
-.margin_ok:
 
     mov rax, [margin_x]
     mov [video + Video.cx], rax
@@ -239,6 +254,9 @@ _e:
     lea r9, [msg]
     call draw_text
 
+    ;================ init =================
+
+    call mem_init
     call keyboard_init
 
     ;================ cursor init =================
@@ -267,7 +285,7 @@ _e:
 
     mov dword [blink_counter], 0
     jmp .busy_loop
- 
+
 .busy_tick:
     call stall_1ms
 
@@ -351,12 +369,16 @@ console_clear:
     mov eax, [video + Video.bg]
     rep stosd
 
+    mov byte [cursor_shown], 0
+
     pop rax
     pop rcx
     pop rdi
     ret
 
 console_scroll:
+    call cursor_erase
+
     push rsi
     push rdi
     push rcx
@@ -412,6 +434,9 @@ console_putc:
     sub rsp, 8
 
     movzx r12d, r9b
+
+    ; Erase current cursor before moving/printing.
+    call cursor_erase
 
     cmp r12b, CHAR_CR
     je .do_cr
@@ -591,6 +616,8 @@ fill_rect:
     push rdi
     push r12
 
+    cld
+
     ; width/height = 0
     test r8, r8
     jz .done
@@ -599,13 +626,11 @@ fill_rect:
 
     ; clip X
     mov rax, [video + Video.w]
-
     cmp rcx, rax
     jae .done
 
     mov r12, rcx
     add r12, r8
-
     cmp r12, rax
     jbe .x_ok
 
@@ -613,16 +638,13 @@ fill_rect:
     mov r8, rax
 
 .x_ok:
-
     ; clip Y
     mov rax, [video + Video.h]
-
     cmp rdx, rax
     jae .done
 
     mov r12, rdx
     add r12, r9
-
     cmp r12, rax
     jbe .y_ok
 
@@ -630,7 +652,6 @@ fill_rect:
     mov r9, rax
 
 .y_ok:
-
     test r8, r8
     jz .done
     test r9, r9
@@ -644,7 +665,6 @@ fill_rect:
     imul rax, rdx
     add rax, rcx
     shl rax, 2
-
     add rdi, rax
 
     ; bytes after each line
@@ -653,7 +673,6 @@ fill_rect:
     shl rbx, 2
 
 .row:
-
     mov eax, r10d
     mov rcx, r8
     rep stosd
@@ -711,7 +730,7 @@ cursor_draw:
     pop rsi
     pop rbx
     ret
-    
+
 cursor_erase:
     cmp byte [cursor_shown], 0
     je .done
@@ -721,8 +740,8 @@ cursor_erase:
     push r8
     push r9
 
-    mov rcx, [video + Video.cx]
-    mov rdx, [video + Video.cy]
+    mov rcx, [cursor_x]
+    mov rdx, [cursor_y]
     mov r8, CHAR_W
     mov r9, CHAR_H
     call fill_rect_bg
@@ -760,8 +779,12 @@ init_keyboard:
     test rcx, rcx
     jz .done
 
+    mov rax, [rcx]
+    test rax, rax
+    jz .done
+
     xor edx, edx
-    call qword [rcx]
+    call rax
 
 .done:
     mov rsp, r12
@@ -785,8 +808,12 @@ keyboard_poll:
     test rcx, rcx
     jz .nokey
 
+    mov rax, [rcx + 8]
+    test rax, rax
+    jz .nokey
+
     lea rdx, [rsp + 32]
-    call qword [rcx + 8]
+    call rax
 
     test rax, rax
     jnz .nokey
@@ -880,12 +907,12 @@ timer_event_init:
     jz .fail
 
     mov ecx, EVT_TIMER
-    xor edx, edx           
-    xor r8d, r8d           
-    xor r9d, r9d           
+    xor edx, edx
+    xor r8d, r8d
+    xor r9d, r9d
 
     lea r10, [timer_event]
-    mov [rsp + 32], r10     
+    mov [rsp + 32], r10
 
     call rax
     test rax, rax
@@ -991,7 +1018,7 @@ timer_restart:
     jz .pop
 
     mov rcx, [timer_event]
-    xor edx, edx            
+    xor edx, edx
     xor r8d, r8d
     call rax
 
@@ -1024,7 +1051,11 @@ stall_1ms:
     test rax, rax
     jz .done
 
-    call qword [rax + BS_STALL]
+    mov rax, [rax + BS_STALL]
+    test rax, rax
+    jz .done
+
+    call rax
 
 .done:
     mov rsp, r12
@@ -1041,19 +1072,31 @@ draw_char:
     push r13
     push r14
     push r15
+    push rbp
 
     mov r12, rcx        ; x
     mov r13, rdx        ; y
     mov r14d, r8d       ; color
+    movzx ebp, r9b
 
-    movzx eax, r9b
-
-    cmp eax, KEY_SPACE
+    cmp ebp, KEY_SPACE
     jb .done
 
-    cmp eax, KEY_DELETE
+    cmp ebp, KEY_DELETE
     ja .done
 
+    ; Simple clipping.
+    mov rax, r12
+    add rax, GLYPH_W
+    cmp rax, [video + Video.w]
+    ja .done
+
+    mov rax, r13
+    add rax, GLYPH_H
+    cmp rax, [video + Video.h]
+    ja .done
+
+    mov eax, ebp
     sub eax, KEY_SPACE
     shl eax, 3
 
@@ -1080,7 +1123,6 @@ draw_char:
     xor r10d, r10d
 
 .row:
-
     cmp r10d, GLYPH_H
     jae .done
 
@@ -1089,7 +1131,6 @@ draw_char:
     xor r11d, r11d
 
 .col:
-
     cmp r11d, GLYPH_W
     jae .next_row
 
@@ -1100,22 +1141,19 @@ draw_char:
     mov [rdi + r11*4], eax
 
 .skip:
-
     shl bl, 1
 
     inc r11d
     jmp .col
 
 .next_row:
-
     add rdi, r15
 
     inc r10d
-
     jmp .row
 
 .done:
-
+    pop rbp
     pop r15
     pop r14
     pop r13
@@ -1123,16 +1161,9 @@ draw_char:
     pop rdi
     pop rsi
     pop rbx
-
     ret
-    
-;================ memory =================
 
-;================================================
-; mem_init
-;
-; Memory subsystem entry point.
-;================================================
+;================ memory =================
 
 mem_init:
     cmp qword [boot_info + BootInfo.mem_map], 0
@@ -1143,7 +1174,6 @@ mem_init:
 .have_map:
     call pmm_init
     ret
-
 
 ;================================================
 ; get_memory_map
@@ -1223,8 +1253,14 @@ get_memory_map:
 
     ; AllocatePool(EfiLoaderData, Size, &Buffer)
     mov ecx, EFI_LOADER_DATA
+    mov rdx, [mm_tmp_size]
     lea r8, [mm_tmp_buffer]
-    call qword [rbx + BS_ALLOCATE_POOL]
+
+    mov rax, [rbx + BS_ALLOCATE_POOL]
+    test rax, rax
+    jz .err_alloc
+    call rax
+
     test rax, rax
     jnz .err_alloc
 
@@ -1262,7 +1298,11 @@ get_memory_map:
     mov rcx, [mm_tmp_buffer]
     test rcx, rcx
     jz .retry_no_free
-    call qword [rbx + BS_FREE_POOL]
+
+    mov rax, [rbx + BS_FREE_POOL]
+    test rax, rax
+    jz .retry_no_free
+    call rax
 
 .retry_no_free:
     inc r14
@@ -1277,6 +1317,9 @@ get_memory_map:
 
     mov rax, [mm_tmp_size]
     mov [boot_info + BootInfo.mem_size], rax
+
+    mov rax, [mm_tmp_key]
+    mov [boot_info + BootInfo.mem_map_key], rax
 
     mov rax, [mm_tmp_desc_size]
     mov [boot_info + BootInfo.mem_desc_size], rax
@@ -1485,7 +1528,6 @@ pmm_init:
 .err_free:
     FAIL_CODE 'G'
 
-
 ;================================================
 ; pmm_clear_range
 ;
@@ -1557,7 +1599,6 @@ pmm_clear_range:
 
 .done:
     ret
-
 
 ;================================================
 ; pmm_alloc_page
@@ -1664,7 +1705,6 @@ pmm_alloc_page:
 .done:
     ret
 
-
 ;================================================
 ; pmm_free_page
 ;
@@ -1715,7 +1755,6 @@ pmm_free_page:
 .done:
     ret
 
-
 ;================================================
 ; mem_alloc
 ;
@@ -1742,7 +1781,6 @@ mem_alloc:
     xor eax, eax
     ret
 
-
 ;================================================
 ; mem_free
 ;
@@ -1754,7 +1792,6 @@ mem_alloc:
 
 mem_free:
     jmp pmm_free_page
-
 
 ;================ fail =================
 
@@ -1773,7 +1810,6 @@ fail_code:
 .fail_halt:
     hlt
     jmp .fail_halt
-
 
 ;================ data =================
 
@@ -1848,6 +1884,7 @@ istruc BootInfo
 
     at BootInfo.mem_map,           dq 0
     at BootInfo.mem_size,          dq 0
+    at BootInfo.mem_map_key,       dq 0
     at BootInfo.mem_desc_size,     dq 0
     at BootInfo.mem_desc_version,  dq 0
 
@@ -1967,6 +2004,9 @@ font_table:
     db 0x76,0xDC,0x00,0x00,0x00,0x00,0x00,0x00
     db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
 
+%if ($ - font_table) != 96 * 8
+    %error "font_table must contain exactly 96 8-byte glyphs"
+%endif
 
 ;================ memory variables =================
 
