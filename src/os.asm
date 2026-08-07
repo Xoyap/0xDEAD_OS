@@ -24,6 +24,7 @@ global _e
 %define BS_STALL               0xF8
 %define BS_SET_WATCHDOG_TIMER  0x100
 %define BS_LOCATE_PROTOCOL     0x140
+%define BS_EXIT_BOOT_SERVICES  0xE8
 
 ; GOP offsets
 %define GOP_MODE               24
@@ -151,6 +152,7 @@ _e:
     sub rsp, 32
 
     mov r12, rdx
+    mov [image_handle], rcx
 
     mov rax, [r12 + ST_CONIN_OFFSET]
     mov [conin], rax
@@ -343,13 +345,29 @@ _e:
     call cursor_draw
     mov dword [blink_counter], 0
 
-    cmp byte [events_ready], 1
-    jne .busy_loop
+    ;================ stage 5: exit boot services test =================
 
-    cmp byte [timer_ready], 1
-    je .event_loop
+    lea r9, [msg_press_key_exit]
+    call draw_text
 
-    jmp .busy_loop
+    call cursor_draw
+
+    call wait_one_key
+
+    call cursor_erase
+
+    lea r9, [msg_exitbs]
+    call draw_text
+
+    call exit_boot_services
+
+    lea r9, [msg_exitbs_ok]
+    call draw_text
+
+.halt_after_exit:
+    cli
+    hlt
+    jmp .halt_after_exit
 ;================ fallback busy loop =================
 
 .busy_loop:
@@ -2325,6 +2343,81 @@ idt_init_minimal:
     pop r12
     pop rbx
     ret
+
+wait_one_key:
+.wait:
+    call keyboard_get
+    test al, al
+    jnz .done
+
+    call stall_1ms
+    jmp .wait
+
+.done:
+    ret
+;================================================
+; exit_boot_services
+;
+; Diagnostic error codes:
+;   X = ExitBootServices failed after retries
+;   Y = Boot Services pointer null
+;   Z = ExitBootServices pointer null
+;================================================
+
+exit_boot_services:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .err_bs
+
+    mov r13, [rbx + BS_EXIT_BOOT_SERVICES]
+    test r13, r13
+    jz .err_ptr
+
+    xor r14, r14
+
+.retry:
+    ; Get a fresh memory map and map key immediately before
+    ; calling ExitBootServices.
+    call get_memory_map
+
+    mov rcx, [image_handle]
+    mov rdx, [boot_info + BootInfo.mem_map_key]
+
+    call r13
+
+    test rax, rax
+    jz .success
+
+    inc r14
+    cmp r14, 3
+    jb .retry
+
+    FAIL_CODE 'X'
+
+.err_bs:
+    FAIL_CODE 'Y'
+
+.err_ptr:
+    FAIL_CODE 'Z'
+
+.success:
+    cli
+
+    mov rsp, r12
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 ;================ fail =================
 
 fail:
@@ -2489,6 +2582,19 @@ old_idtr_limit:
     dw 0
 old_idtr_base:
     dq 0
+    
+align 8
+image_handle:
+    dq 0
+    
+msg_press_key_exit:
+    db "Press any key to exit Boot Services...",10,0
+
+msg_exitbs:
+    db "Exiting Boot Services...",10,0
+
+msg_exitbs_ok:
+    db "Boot services exited. System halted.",10,0
 ;================ fonts =================
 
 font_table:
