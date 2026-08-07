@@ -87,6 +87,27 @@ global _e
 %define PMM_MAX_PAGES          0x200000
 %define PMM_BITMAP_SIZE        (PMM_MAX_PAGES / 8)
 
+;================ vmm defines =================
+
+%define PAGE_PRESENT             (1 << 0)
+%define PAGE_WRITABLE            (1 << 1)
+%define PAGE_USER                (1 << 2)
+%define PAGE_WRITETHROUGH        (1 << 3)
+%define PAGE_CACHE_DISABLE       (1 << 4)
+%define PAGE_ACCESSED            (1 << 5)
+%define PAGE_DIRTY               (1 << 6)
+%define PAGE_SIZE_FLAG           (1 << 7)
+%define PAGE_GLOBAL              (1 << 8)
+
+%define PT_INDEX_BITS            0x1FF
+%define VMM_2MB_PAGE_SIZE        (2 * 1024 * 1024)
+
+%macro MASK_FRAME 1
+    shl %1, 12
+    shr %1, 12
+    and %1, -4096
+%endmacro
+
 %macro FAIL_CODE 1
     mov al, %1
     jmp fail_code
@@ -257,22 +278,78 @@ _e:
     ;================ init =================
 
     call mem_init
+
+    ;================ vmm stage 1 =================
+    ; Build page tables, but do NOT activate CR3 yet.
+
+    lea r9, [msg_vmm_build]
+    call draw_text
+
+    call vmm_build
+
+    lea r9, [msg_vmm_ok]
+    call draw_text
+
+    ;================ keyboard =================
+
     call keyboard_init
 
     ;================ cursor init =================
 
     call cursor_draw
 
-    ;================ start key loop =================
+    ;================ events before CR3 =================
+    ; Create UEFI events before switching page tables.
 
     call key_event_init
+    call timer_event_init
+
+    ;================ vmm stage 2 =================
+    ; Activate CR3.
+
+    lea r9, [msg_vmm_activate]
+    call draw_text
+
+    call vmm_activate
+
+    lea r9, [msg_vmm_active]
+    call draw_text
+
+    ;================ choose loop =================
+
+    mov dword [blink_counter], 0
+
+    cmp byte [events_ready], 1
+    jne .use_busy_loop
+
+    cmp byte [timer_ready], 1
+    jne .use_busy_loop
+
+    lea r9, [msg_events_ready]
+    call draw_text
+
+    jmp .prepare_idt
+
+.use_busy_loop:
+    lea r9, [msg_events_busy]
+    call draw_text
+
+.prepare_idt:
+    call idt_init_minimal
+
+    lea r9, [msg_idt_ok]
+    call draw_text
+
+    call cursor_draw
+    mov dword [blink_counter], 0
+
     cmp byte [events_ready], 1
     jne .busy_loop
 
-    call timer_event_init
     cmp byte [timer_ready], 1
     je .event_loop
 
+    jmp .busy_loop
 ;================ fallback busy loop =================
 
 .busy_loop:
@@ -1416,17 +1493,10 @@ pmm_init:
     cmp r15, rbx
     jb .finish
 
-    ; Usable memory types for this stage:
-    ;   3 = EfiBootServicesCode
-    ;   4 = EfiBootServicesData
-    ;   7 = EfiConventionalMemory
+    ; Stage 1 VMM safety:
+    ; Only EfiConventionalMemory is safely allocatable before
+    ; ExitBootServices when we actually allocate page-table pages.
     mov eax, [r14]
-    cmp eax, MEM_TYPE_BS_CODE
-    je .usable
-
-    cmp eax, MEM_TYPE_BS_DATA
-    je .usable
-
     cmp eax, MEM_TYPE_CONVENTIONAL
     je .usable
 
@@ -1793,6 +1863,468 @@ mem_alloc:
 mem_free:
     jmp pmm_free_page
 
+;================ vmm =================
+
+zero_page:
+    push rdi
+    push rcx
+    push rax
+
+    cld
+    mov rdi, rcx
+    xor eax, eax
+    mov rcx, PAGE_SIZE / 8
+    rep stosq
+
+    pop rax
+    pop rcx
+    pop rdi
+    ret
+
+vmm_map_2mb:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    mov r12, rcx        ; physical/virtual address
+    mov r13, rdx        ; extra flags
+
+    mov rbx, [pml4_ptr]
+    test rbx, rbx
+    jz .oom
+
+    ; ---- PML4 -> PDPT ----
+    mov rax, r12
+    shr rax, 39
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+
+    mov rax, [rbx + r14 * 8]
+    test al, PAGE_PRESENT
+    jnz .pdpt_ready
+
+    call pmm_alloc_page
+    test rax, rax
+    jz .oom
+
+    mov rcx, rax
+    call zero_page
+
+    or rax, PAGE_PRESENT | PAGE_WRITABLE
+    mov [rbx + r14 * 8], rax
+
+.pdpt_ready:
+    mov rax, [rbx + r14 * 8]
+    MASK_FRAME rax
+    mov rbx, rax
+
+    ; ---- PDPT -> PD ----
+    mov rax, r12
+    shr rax, 30
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+
+    mov rax, [rbx + r14 * 8]
+    test al, PAGE_PRESENT
+    jnz .pd_ready
+
+    call pmm_alloc_page
+    test rax, rax
+    jz .oom
+
+    mov rcx, rax
+    call zero_page
+
+    or rax, PAGE_PRESENT | PAGE_WRITABLE
+    mov [rbx + r14 * 8], rax
+
+.pd_ready:
+    mov rax, [rbx + r14 * 8]
+    MASK_FRAME rax
+    mov rbx, rax
+
+    ; ---- install 2MB page ----
+    mov rax, r12
+    shr rax, 21
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+
+    mov rax, [rbx + r14 * 8]
+    test al, PAGE_PRESENT
+    jz .install
+
+    test al, PAGE_SIZE_FLAG
+    jz .conflict
+
+.install:
+    mov rax, r12
+    or rax, r13
+    or rax, PAGE_PRESENT | PAGE_SIZE_FLAG
+    mov [rbx + r14 * 8], rax
+
+    xor eax, eax
+    jmp .done
+
+.conflict:
+    mov eax, 1
+    jmp .done
+
+.oom:
+    mov eax, 2
+
+.done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+vmm_build:
+    push rbx
+    push r12
+    push r13
+
+    ; Allocate PML4 page
+    call pmm_alloc_page
+    test rax, rax
+    jz .oom
+
+    mov [pml4_ptr], rax
+    mov rcx, rax
+    call zero_page
+
+    ; ---- compute identity-map ceiling ----
+    mov rax, PMM_MAX_PAGES
+    shl rax, PAGE_SHIFT
+    mov r12, rax
+
+    ; Also map enough of the framebuffer.
+    mov rax, [video + Video.sl]
+    mov rdx, [video + Video.h]
+    imul rax, rdx
+    shl rax, 2
+    add rax, [video + Video.fb]
+
+    add rax, VMM_2MB_PAGE_SIZE - 1
+    and rax, -VMM_2MB_PAGE_SIZE
+
+    cmp rax, r12
+    jbe .ceiling_ok
+    mov r12, rax
+.ceiling_ok:
+
+    ; ---- map [0, ceiling) in 2MB steps ----
+    xor r13, r13
+
+.map_loop:
+    cmp r13, r12
+    jae .map_done
+
+    mov rcx, r13
+    mov rdx, PAGE_WRITABLE
+    call vmm_map_2mb
+
+    test eax, eax
+    jz .map_next
+
+    cmp eax, 1
+    je .conflict
+
+    jmp .oom
+
+.map_next:
+    add r13, VMM_2MB_PAGE_SIZE
+    jmp .map_loop
+
+.map_done:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.conflict:
+    FAIL_CODE 'H'
+
+.oom:
+    FAIL_CODE 'I'
+
+vmm_activate:
+    mov rax, [pml4_ptr]
+    test rax, rax
+    jz .done
+
+    mov cr3, rax
+
+.done:
+    ret
+;================ minimal idt / exceptions =================
+
+%macro ISR_NOERR 1
+isr_stub_%1:
+    push qword 0
+    push qword %1
+    jmp isr_common
+%endmacro
+
+%macro ISR_ERR 1
+isr_stub_%1:
+    push qword %1
+    jmp isr_common
+%endmacro
+
+ISR_NOERR 0
+ISR_NOERR 1
+ISR_NOERR 2
+ISR_NOERR 3
+ISR_NOERR 4
+ISR_NOERR 5
+ISR_NOERR 6
+ISR_NOERR 7
+ISR_ERR   8
+ISR_NOERR 9
+ISR_ERR   10
+ISR_ERR   11
+ISR_ERR   12
+ISR_ERR   13
+ISR_ERR   14
+ISR_NOERR 15
+ISR_NOERR 16
+ISR_ERR   17
+ISR_NOERR 18
+ISR_NOERR 19
+ISR_NOERR 20
+ISR_ERR   21
+ISR_NOERR 22
+ISR_NOERR 23
+ISR_NOERR 24
+ISR_NOERR 25
+ISR_NOERR 26
+ISR_NOERR 27
+ISR_NOERR 28
+ISR_NOERR 29
+ISR_ERR   30
+ISR_NOERR 31
+
+align 8
+isr_stub_table:
+    dd isr_stub_0 - isr_stub_table
+    dd isr_stub_1 - isr_stub_table
+    dd isr_stub_2 - isr_stub_table
+    dd isr_stub_3 - isr_stub_table
+    dd isr_stub_4 - isr_stub_table
+    dd isr_stub_5 - isr_stub_table
+    dd isr_stub_6 - isr_stub_table
+    dd isr_stub_7 - isr_stub_table
+    dd isr_stub_8 - isr_stub_table
+    dd isr_stub_9 - isr_stub_table
+    dd isr_stub_10 - isr_stub_table
+    dd isr_stub_11 - isr_stub_table
+    dd isr_stub_12 - isr_stub_table
+    dd isr_stub_13 - isr_stub_table
+    dd isr_stub_14 - isr_stub_table
+    dd isr_stub_15 - isr_stub_table
+    dd isr_stub_16 - isr_stub_table
+    dd isr_stub_17 - isr_stub_table
+    dd isr_stub_18 - isr_stub_table
+    dd isr_stub_19 - isr_stub_table
+    dd isr_stub_20 - isr_stub_table
+    dd isr_stub_21 - isr_stub_table
+    dd isr_stub_22 - isr_stub_table
+    dd isr_stub_23 - isr_stub_table
+    dd isr_stub_24 - isr_stub_table
+    dd isr_stub_25 - isr_stub_table
+    dd isr_stub_26 - isr_stub_table
+    dd isr_stub_27 - isr_stub_table
+    dd isr_stub_28 - isr_stub_table
+    dd isr_stub_29 - isr_stub_table
+    dd isr_stub_30 - isr_stub_table
+    dd isr_stub_31 - isr_stub_table
+
+%if ($ - isr_stub_table) != 32 * 4
+    %error "isr_stub_table does not have exactly 32 entries"
+%endif
+
+isr_common:
+    cli
+
+    ; stack layout from stub:
+    ; [rsp]     vector
+    ; [rsp + 8] error code
+    ; [rsp + 16] rip
+    mov rcx, [rsp]
+    mov rdx, [rsp + 8]
+    mov r8, [rsp + 16]
+
+    mov rax, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    call panic_exception
+
+panic_exception:
+    cli
+
+    push r15
+    push r14
+    push r13
+
+    mov r15, rcx        ; vector
+    mov r14, rdx        ; error code
+    mov r13, r8         ; rip
+
+    mov qword [video + Video.fg], 0x00FF5A5A
+    mov qword [video + Video.bg], 0x00140000
+    mov byte [cursor_shown], 0
+
+    call console_clear
+
+    mov rax, [margin_x]
+    mov [video + Video.cx], rax
+    mov qword [video + Video.cy], START_Y
+
+    call ensure_y
+
+    lea r9, [str_panic_banner]
+    call draw_text
+
+    lea r9, [str_vector]
+    call draw_text
+    mov rcx, r15
+    call print_hex64
+
+    lea r9, [str_error]
+    call draw_text
+    mov rcx, r14
+    call print_hex64
+
+    lea r9, [str_rip]
+    call draw_text
+    mov rcx, r13
+    call print_hex64
+
+    lea r9, [str_halted]
+    call draw_text
+
+.halt:
+    cli
+    hlt
+    jmp .halt
+
+print_hex64:
+    push rbx
+    push r13
+    push r14
+
+    mov r13, rcx
+    lea rbx, [hex_digits]
+    mov r14, 64
+
+.digit_loop:
+    sub r14, 4
+
+    mov rax, r13
+    mov ecx, r14d
+    shr rax, cl
+    and eax, 0x0F
+
+    movzx r9d, byte [rbx + rax]
+    call console_putc
+
+    test r14, r14
+    jnz .digit_loop
+
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+idt_init_minimal:
+    push rbx
+    push r12
+    push r13
+    push rsi
+    push rdi
+
+    cld
+
+    ; Save current IDTR
+    sidt [old_idtr_limit]
+
+    ; Zero our IDT
+    lea rdi, [idt]
+    xor eax, eax
+    mov rcx, (256 * 16) / 8
+    rep stosq
+
+    ; Copy old IDT, if present
+    movzx ecx, word [old_idtr_limit]
+    inc rcx
+
+    cmp rcx, 256 * 16
+    jbe .copy_ok
+
+    mov rcx, 256 * 16
+
+.copy_ok:
+    mov rsi, [old_idtr_base]
+    test rsi, rsi
+    jz .no_copy
+
+    lea rdi, [idt]
+    rep movsb
+
+.no_copy:
+    ; Use current CS, no new GDT yet.
+    mov ax, cs
+    movzx r12, ax
+
+    xor r13, r13
+
+.fill_loop:
+    lea rbx, [isr_stub_table]
+    movsxd rax, dword [rbx + r13 * 4]
+    lea rax, [rbx + rax]
+
+    lea rdi, [idt]
+    mov rcx, r13
+    imul rcx, 16
+    add rdi, rcx
+
+    ; IDT entry:
+    ; offset_low  0
+    ; selector    2
+    ; ist         4
+    ; type_attr   5
+    ; offset_mid  6
+    ; offset_high 8
+    ; reserved    12
+
+    mov [rdi + 0], ax
+    mov word [rdi + 2], r12w
+    mov byte [rdi + 4], 0
+    mov byte [rdi + 5], 0x8E
+
+    shr rax, 16
+    mov [rdi + 6], ax
+
+    shr rax, 16
+    mov dword [rdi + 8], eax
+    mov dword [rdi + 12], 0
+
+    inc r13
+    cmp r13, 32
+    jb .fill_loop
+
+    lidt [new_idtr_limit]
+
+    pop rdi
+    pop rsi
+    pop r13
+    pop r12
+    pop rbx
+    ret
 ;================ fail =================
 
 fail:
@@ -1904,6 +2436,59 @@ msg:
     db "Framebuffer Text System",10
     db ">",0
 
+msg_vmm_build:
+    db "VMM: building tables...",10,0
+
+msg_vmm_ok:
+    db "VMM: tables built (not activated)",10,0
+    
+msg_vmm_activate:
+    db "VMM: activating CR3...",10,0
+
+msg_vmm_active:
+    db "VMM: CR3 active",10,0
+    
+msg_events_ready:
+    db "Events: ready",10,0
+
+msg_events_busy:
+    db "Events: using busy loop",10,0
+    
+msg_idt_ok:
+    db "IDT: installed",10,0
+
+hex_digits:
+    db "0123456789ABCDEF"
+
+str_panic_banner:
+    db "!!! EXCEPTION !!!",10,0
+
+str_vector:
+    db "Vector: 0x",0
+
+str_error:
+    db 10,"Error : 0x",0
+
+str_rip:
+    db 10,"RIP   : 0x",0
+
+str_halted:
+    db 10,"System halted.",0
+
+align 16
+idt:
+    times 256 * 16 db 0
+
+align 16
+new_idtr_limit:
+    dw (256 * 16) - 1
+new_idtr_base:
+    dq idt
+
+old_idtr_limit:
+    dw 0
+old_idtr_base:
+    dq 0
 ;================ fonts =================
 
 font_table:
@@ -2019,6 +2604,9 @@ mm_tmp_desc_version:  dd 0
 
 align 8
 pmm_next_word:        dq 0
+
+align 8
+pml4_ptr:             dq 0
 
 align 4096
 pmm_bitmap:           times PMM_BITMAP_SIZE db 0
