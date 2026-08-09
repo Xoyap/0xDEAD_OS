@@ -99,6 +99,11 @@ global _e
 %define KHEAP_ORDER         9
 %define KHEAP_HEADER_SIZE   16
 %define KHEAP_MIN_SPLIT     32
+%define KMEM_FLAG_ZERO 1
+
+%define MM_FLAG_ZERO   1
+%define MM_FLAG_DMA    2
+%define MM_FLAG_DMA32  4
 
 %macro MASK_FRAME 1
     shl %1, 12
@@ -3110,6 +3115,222 @@ heap_test:
     call draw_text
     ret    
 
+;================ stable mm API =================
+
+mm_alloc_page:
+    jmp pmm_alloc_page
+
+mm_free_page:
+    jmp pmm_free_page
+
+mm_alloc_order:
+    jmp pmm_alloc_order
+
+mm_free_order:
+    jmp pmm_free_order
+
+kmem_alloc:
+    jmp kmalloc
+
+kmem_free:
+    jmp kfree
+
+kmemset:
+    push rdi
+    push rcx
+    push rdx
+    push rax
+
+    mov rdi, rcx
+    mov rax, r8
+    mov rcx, rdx
+
+    cld
+    rep stosb
+
+    pop rax
+    pop rdx
+    pop rcx
+    pop rdi
+    ret
+
+kmem_zalloc:
+    push rbx
+    push r12
+    push r13
+
+    mov r12, rcx
+
+    call kmalloc
+    test rax, rax
+    jz .done
+
+    mov r13, rax
+
+    mov rdx, [r13 - KHEAP_HEADER_SIZE]
+    sub rdx, KHEAP_HEADER_SIZE
+
+    mov rcx, r13
+    xor r8d, r8d
+    call kmemset
+
+    mov rax, r13
+
+.done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+kmem_alloc_flags:
+    test dl, KMEM_FLAG_ZERO
+    jz .no_zero
+
+    jmp kmem_zalloc
+
+.no_zero:
+    jmp kmalloc
+
+kmem_test:
+    push r12
+
+    call kheap_init
+    test eax, eax
+    jnz .fail
+
+    mov rcx, 128
+    mov rdx, KMEM_FLAG_ZERO
+    call kmem_alloc_flags
+
+    test rax, rax
+    jz .fail
+
+    mov r12, rax
+
+    cmp byte [r12], 0
+    jne .fail_free
+
+    cmp byte [r12 + 127], 0
+    jne .fail_free
+
+    mov byte [r12], 0xAA
+
+    mov rcx, r12
+    call kmem_free
+
+    pop r12
+
+    lea r9, [msg_kmemtest_ok]
+    call draw_text
+    ret
+
+.fail_free:
+    mov rcx, r12
+    call kmem_free
+
+.fail:
+    pop r12
+
+    lea r9, [msg_kmemtest_fail]
+    call draw_text
+    ret
+
+mm_alloc_order_flags:
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, rcx        ; order
+    mov r13, rdx        ; flags
+
+    call pmm_alloc_order
+    test rax, rax
+    jz .done
+
+    test r13, MM_FLAG_ZERO
+    jz .done
+
+    mov r15, rax
+    mov r14, rax
+
+    mov rcx, 1
+    mov edx, r12d
+    shl rcx, cl
+
+.zero_loop:
+    test rcx, rcx
+    jz .zero_done
+
+    push rcx
+    push r14
+
+    mov rcx, r14
+    call zero_page
+
+    pop r14
+    pop rcx
+
+    add r14, PAGE_SIZE
+    dec rcx
+    jmp .zero_loop
+
+.zero_done:
+    mov rax, r15
+
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+mm_alloc_page_flags:
+    mov rdx, rcx
+    xor ecx, ecx
+    jmp mm_alloc_order_flags
+
+mm_flags_test:
+    push r12
+
+    mov rcx, 1
+    mov rdx, MM_FLAG_ZERO
+    call mm_alloc_order_flags
+
+    test rax, rax
+    jz .fail
+
+    mov r12, rax
+
+    cmp byte [r12], 0
+    jne .fail_free
+
+    lea rax, [r12 + (2 * PAGE_SIZE) - 1]
+    cmp byte [rax], 0
+    jne .fail_free
+
+    mov rcx, r12
+    mov rdx, 1
+    call mm_free_order
+
+    pop r12
+
+    lea r9, [msg_mmflags_ok]
+    call draw_text
+    ret
+
+.fail_free:
+    mov rcx, r12
+    mov rdx, 1
+    call mm_free_order
+
+.fail:
+    pop r12
+
+    lea r9, [msg_mmflags_fail]
+    call draw_text
+    ret
+
 isr_common:
     cli
 
@@ -3424,6 +3645,16 @@ cmd_execute:
     test eax, eax
     jnz .heaptest
 
+    lea rsi, [str_cmd_kmemtest]
+    call cmd_is
+    test eax, eax
+    jnz .kmemtest
+
+    lea rsi, [str_cmd_mmflags]
+    call cmd_is
+    test eax, eax
+    jnz .mmflags
+
     lea rsi, [str_cmd_exit]
     call cmd_is
     test eax, eax
@@ -3724,6 +3955,14 @@ cmd_execute:
 
 .heaptest:
     call heap_test
+    ret
+
+.kmemtest:
+    call kmem_test
+    ret
+
+.mmflags:
+    call mm_flags_test
     ret
 
 .exit:
@@ -4029,6 +4268,8 @@ msg_help:
     db "  highmap  - map physical memory to higher-half",10
     db "  heap     - initialize/show kernel heap",10
     db "  heaptest - test kernel heap",10
+    db "  kmemtest - test kmem API",10
+    db "  mmflags  - test MM allocation flags",10
     db "  exit     - exit boot services",10
     db 0
 
@@ -4162,6 +4403,15 @@ str_heap_base:
 
 str_heap_size:
     db "Heap size: 0x",0
+
+str_cmd_kmemtest:
+    db "kmemtest",0
+
+msg_kmemtest_ok:
+    db "Kmem test: OK",10,0
+
+msg_kmemtest_fail:
+    db "Kmem test: FAIL",10,0
     
 font_table:
     db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
