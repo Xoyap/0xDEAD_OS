@@ -625,25 +625,28 @@ draw_char_with_bg:
     pop rbx
     ret
 
+;================ DRAW_TEXT =================
+
 draw_text:
-    push rsi
+    push r12
     sub rsp, 8
-    mov rsi, r9
+
+    mov r12, r9
 
 .next:
-    mov al, [rsi]
+    mov al, [r12]
     test al, al
     jz .done
 
     mov r9b, al
     call console_putc
 
-    inc rsi
+    inc r12
     jmp .next
 
 .done:
     add rsp, 8
-    pop rsi
+    pop r12
     ret
 
 backspace:
@@ -2102,12 +2105,15 @@ pmm_order_cache_pop:
 .done:
     ret
 
+;================ PMM_ALLOC_ORDER =================
+
 pmm_alloc_order:
     push rbx
     push r12
     push r13
     push r14
     push r15
+    sub rsp, 8
 
     mov r12, rcx
 
@@ -2173,6 +2179,7 @@ pmm_alloc_order:
     xor eax, eax
 
 .done:
+    add rsp, 8
     pop r15
     pop r14
     pop r13
@@ -2180,12 +2187,15 @@ pmm_alloc_order:
     pop rbx
     ret
 
+;================ PMM_FREE_ORDER =================
+
 pmm_free_order:
     push rbx
     push r12
     push r13
     push r14
     push r15
+    sub rsp, 8
 
     mov r12, rcx
     mov r13, rdx
@@ -2248,6 +2258,7 @@ pmm_free_order:
     mov [pmm_next_word], rax
 
 .done:
+    add rsp, 8
     pop r15
     pop r14
     pop r13
@@ -2292,12 +2303,15 @@ zero_page:
     pop rdi
     ret
 
+;================ VMM_MAP_2MB =================
+
 vmm_map_2mb:
     push rbx
     push r12
     push r13
     push r14
     push r15
+    sub rsp, 8
 
     mov r12, rcx
     mov r13, rdx
@@ -2384,6 +2398,7 @@ vmm_map_2mb:
     mov eax, 2
 
 .done:
+    add rsp, 8
     pop r15
     pop r14
     pop r13
@@ -2391,10 +2406,13 @@ vmm_map_2mb:
     pop rbx
     ret
 
+;================ VMM_BUILD =================
+
 vmm_build:
     push rbx
     push r12
     push r13
+    sub rsp, 8
 
     call pmm_alloc_page
     test rax, rax
@@ -2464,6 +2482,7 @@ vmm_build:
 
 .map_done:
     xor eax, eax
+    add rsp, 8
     pop r13
     pop r12
     pop rbx
@@ -3150,10 +3169,16 @@ idt_init_minimal:
     pop rbx
     ret
 
+;================ KHEAP_INIT =================
+
 kheap_init:
     push rbx
     push r12
     push r13
+    sub rsp, 8
+
+    cmp byte [vmm_active], 1
+    jne .fail
 
     cmp byte [kheap_active], 1
     je .ok
@@ -3182,6 +3207,7 @@ kheap_init:
 
 .ok:
     xor eax, eax
+    add rsp, 8
     pop r13
     pop r12
     pop rbx
@@ -3194,6 +3220,7 @@ kheap_init:
 
 .fail:
     mov eax, 1
+    add rsp, 8
     pop r13
     pop r12
     pop rbx
@@ -3381,10 +3408,13 @@ kfree:
     pop rbx
     ret
     
+;================ HEAP_TEST =================
+
 heap_test:
     push r12
     push r13
     push r14
+    sub rsp, 8
 
     call kheap_init
     test eax, eax
@@ -3429,6 +3459,7 @@ heap_test:
     mov rcx, rax
     call kfree
 
+    add rsp, 8
     pop r14
     pop r13
     pop r12
@@ -3438,13 +3469,14 @@ heap_test:
     ret
 
 .fail:
+    add rsp, 8
     pop r14
     pop r13
     pop r12
 
     lea r9, [msg_heaptest_fail]
     call draw_text
-    ret    
+    ret
 
 mm_alloc_page:
     jmp pmm_alloc_page
@@ -3514,10 +3546,13 @@ kmemset:
     pop rdi
     ret
 
+;================ KMEM_ZALLOC =================
+
 kmem_zalloc:
     push rbx
     push r12
     push r13
+    sub rsp, 8
 
     mov r12, rcx
 
@@ -3537,6 +3572,7 @@ kmem_zalloc:
     mov rax, r13
 
 .done:
+    add rsp, 8
     pop r13
     pop r12
     pop rbx
@@ -3551,8 +3587,11 @@ kmem_alloc_flags:
 .no_zero:
     jmp kmalloc
 
+;================ KMEM_TEST =================
+
 kmem_test:
     push r12
+    sub rsp, 8
 
     call kheap_init
     test eax, eax
@@ -3578,6 +3617,7 @@ kmem_test:
     mov rcx, r12
     call kmem_free
 
+    add rsp, 8
     pop r12
 
     lea r9, [msg_kmemtest_ok]
@@ -3589,11 +3629,14 @@ kmem_test:
     call kmem_free
 
 .fail:
+    add rsp, 8
     pop r12
 
     lea r9, [msg_kmemtest_fail]
     call draw_text
     ret
+
+;================ PMM_ALLOC_ORDER_FLAGS =================
 
 pmm_alloc_order_flags:
     push rbx
@@ -3601,27 +3644,27 @@ pmm_alloc_order_flags:
     push r13
     push r14
     push r15
+    sub rsp, 8
 
-    mov r12, rcx        ; order
-    mov r13, rdx        ; flags
+    mov r12, rcx
+    mov r13, rdx
 
     cmp r12, PMM_ORDER_MAX
     ja .fail
 
-    ; Determine zone limit in pages
     mov r14, [boot_info + BootInfo.pmm_total_pages]
 
     test r13, MM_FLAG_DMA
     jz .not_dma
 
-    mov r14, ZONE_DMA_LIMIT >> PAGE_SHIFT
+    mov r14, (ZONE_DMA_LIMIT >> PAGE_SHIFT)
     jmp .limit_done
 
 .not_dma:
     test r13, MM_FLAG_DMA32
     jz .limit_done
 
-    mov r14, ZONE_DMA32_LIMIT >> PAGE_SHIFT
+    mov r14, (ZONE_DMA32_LIMIT >> PAGE_SHIFT)
 
 .limit_done:
     cmp r14, [boot_info + BootInfo.pmm_total_pages]
@@ -3631,7 +3674,6 @@ pmm_alloc_order_flags:
 
 .limit_ok:
 
-    ; Try Buddy PMM first, if usable for this zone
     cmp byte [buddy_pmm_active], 1
     jne .bitmap
 
@@ -3639,7 +3681,7 @@ pmm_alloc_order_flags:
     ja .bitmap
 
     mov r15, 1
-    mov ecx, r12d
+    mov ecx, BUDDY_PMM_ORDER
     shl r15, cl
 
     mov rax, [buddy_pmm_pool_phys]
@@ -3654,7 +3696,6 @@ pmm_alloc_order_flags:
     jnz .done
 
 .bitmap:
-    ; Fallback to bitmap allocator, restricted by zone limit
     mov r13, 1
     mov ecx, r12d
     shl r13, cl
@@ -3696,6 +3737,7 @@ pmm_alloc_order_flags:
     shl rax, PAGE_SHIFT
 
 .done:
+    add rsp, 8
     pop r15
     pop r14
     pop r13
@@ -3705,7 +3747,7 @@ pmm_alloc_order_flags:
 
 .fail:
     xor eax, eax
-
+    add rsp, 8
     pop r15
     pop r14
     pop r13
@@ -3768,8 +3810,11 @@ mm_alloc_page_flags:
     xor ecx, ecx
     jmp mm_alloc_order_flags
 
+;================ MM_FLAGS_TEST =================
+
 mm_flags_test:
     push r12
+    sub rsp, 8
 
     mov rcx, 1
     mov rdx, MM_FLAG_ZERO
@@ -3791,6 +3836,7 @@ mm_flags_test:
     mov rdx, 1
     call mm_free_order
 
+    add rsp, 8
     pop r12
 
     lea r9, [msg_mmflags_ok]
@@ -3803,6 +3849,7 @@ mm_flags_test:
     call mm_free_order
 
 .fail:
+    add rsp, 8
     pop r12
 
     lea r9, [msg_mmflags_fail]
@@ -4166,12 +4213,15 @@ buddy_init:
     pop rbx
     ret
     
+;================ BUDDY_ALLOC =================
+
 buddy_alloc:
     push rbx
     push r12
     push r13
     push r14
     push r15
+    sub rsp, 8
 
     mov r12, rcx
 
@@ -4223,6 +4273,7 @@ buddy_alloc:
     mov qword [r15], 0
     mov rax, r15
 
+    add rsp, 8
     pop r15
     pop r14
     pop r13
@@ -4232,7 +4283,7 @@ buddy_alloc:
 
 .fail:
     xor eax, eax
-
+    add rsp, 8
     pop r15
     pop r14
     pop r13
@@ -4798,12 +4849,15 @@ buddy_pmm_remove:
     pop r9
     ret
 
+;================ BUDDY_PMM_ALLOC =================
+
 buddy_pmm_alloc:
     push rbx
     push r12
     push r13
     push r14
     push r15
+    sub rsp, 8
 
     mov r12, rcx
 
@@ -4849,6 +4903,7 @@ buddy_pmm_alloc:
 .done:
     mov rax, r15
 
+    add rsp, 8
     pop r15
     pop r14
     pop r13
@@ -4858,13 +4913,14 @@ buddy_pmm_alloc:
 
 .fail:
     xor eax, eax
-
+    add rsp, 8
     pop r15
     pop r14
     pop r13
     pop r12
     pop rbx
     ret
+
 
 buddy_pmm_free:
     push r12
@@ -5353,21 +5409,24 @@ slab_refill:
     pop rbx
     ret
 
+;================ SLAB_ALLOC =================
+
 slab_alloc:
     push rbx
     push r12
     push r13
+    sub rsp, 8
 
-    mov r12, rcx        ; size
+    mov r12, rcx
 
     call slab_cache_index
     cmp rax, SLAB_CACHE_COUNT
     jae .fail
 
-    mov r12, rax        ; cache index
+    mov r12, rax
 
 .retry:
-    mov rax, [slab_free_heads + r12*8]
+    mov rax, [slab_free_heads + r12 * 8]
     test rax, rax
     jnz .got
 
@@ -5376,15 +5435,16 @@ slab_alloc:
     test eax, eax
     jnz .fail
 
-    mov rax, [slab_free_heads + r12*8]
+    mov rax, [slab_free_heads + r12 * 8]
     test rax, rax
     jnz .got
     jmp .fail
 
 .got:
     mov rbx, [rax]
-    mov [slab_free_heads + r12*8], rbx
+    mov [slab_free_heads + r12 * 8], rbx
 
+    add rsp, 8
     pop r13
     pop r12
     pop rbx
@@ -5392,18 +5452,22 @@ slab_alloc:
 
 .fail:
     xor eax, eax
+    add rsp, 8
     pop r13
     pop r12
     pop rbx
     ret
 
+;================ SLAB_FREE =================
+
 slab_free:
     push rax
     push r12
     push r13
+    sub rsp, 8
 
-    mov r12, rcx        ; size
-    mov r13, rdx        ; pointer
+    mov r12, rcx
+    mov r13, rdx
 
     test r13, r13
     jz .done
@@ -5413,11 +5477,12 @@ slab_free:
     cmp rax, SLAB_CACHE_COUNT
     jae .done
 
-    mov rcx, [slab_free_heads + rax*8]
+    mov rcx, [slab_free_heads + rax * 8]
     mov [r13], rcx
-    mov [slab_free_heads + rax*8], r13
+    mov [slab_free_heads + rax * 8], r13
 
 .done:
+    add rsp, 8
     pop r13
     pop r12
     pop rax
