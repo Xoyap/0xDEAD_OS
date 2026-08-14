@@ -113,6 +113,15 @@ global _e
 %define BUDDY_STATIC_BLOCK_SIZE (1 << (PAGE_SHIFT + BUDDY_STATIC_ORDER))
 %define BUDDY_PMM_ORDER 9
 %define BUDDY_PMM_BLOCK_SIZE (1 << (PAGE_SHIFT + BUDDY_PMM_ORDER))
+%define ZONE_DMA_LIMIT    0x1000000      ; 16 MiB
+%define ZONE_DMA32_LIMIT  0x100000000    ; 4 GiB
+%define SLAB_CACHE_COUNT 8
+%define SLAB_TEST_COUNT 300
+%define MEM_TYPE_LOADER_CODE 1
+%define MEM_TYPE_LOADER_DATA 2
+
+%define PHYS_MAP_BASE          0xFFFF910000000000
+%define HH_DIRECT_MAP_LIMIT    0x100000000   ; 4 GiB
 
 %macro MASK_FRAME 1
     shl %1, 12
@@ -3446,8 +3455,39 @@ mm_free_page:
 mm_alloc_order:
     jmp pmm_alloc_order
 
+pmm_free_order_flags:
+    push rax
+    push r10
+
+    ; If address belongs to Buddy PMM pool, free it there
+    mov rax, [buddy_pmm_pool_phys]
+    test rax, rax
+    jz .normal_pmm
+
+    cmp rcx, rax
+    jb .normal_pmm
+
+    mov r10, rax
+    add r10, BUDDY_PMM_BLOCK_SIZE
+
+    cmp rcx, r10
+    jae .normal_pmm
+
+    call buddy_pmm_free
+
+    pop r10
+    pop rax
+    ret
+
+.normal_pmm:
+    call pmm_free_order
+
+    pop r10
+    pop rax
+    ret
+
 mm_free_order:
-    jmp pmm_free_order
+    jmp pmm_free_order_flags
 
 kmem_alloc:
     jmp kmalloc
@@ -3555,16 +3595,134 @@ kmem_test:
     call draw_text
     ret
 
+pmm_alloc_order_flags:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, rcx        ; order
+    mov r13, rdx        ; flags
+
+    cmp r12, PMM_ORDER_MAX
+    ja .fail
+
+    ; Determine zone limit in pages
+    mov r14, [boot_info + BootInfo.pmm_total_pages]
+
+    test r13, MM_FLAG_DMA
+    jz .not_dma
+
+    mov r14, ZONE_DMA_LIMIT >> PAGE_SHIFT
+    jmp .limit_done
+
+.not_dma:
+    test r13, MM_FLAG_DMA32
+    jz .limit_done
+
+    mov r14, ZONE_DMA32_LIMIT >> PAGE_SHIFT
+
+.limit_done:
+    cmp r14, [boot_info + BootInfo.pmm_total_pages]
+    jbe .limit_ok
+
+    mov r14, [boot_info + BootInfo.pmm_total_pages]
+
+.limit_ok:
+
+    ; Try Buddy PMM first, if usable for this zone
+    cmp byte [buddy_pmm_active], 1
+    jne .bitmap
+
+    cmp r12, BUDDY_PMM_ORDER
+    ja .bitmap
+
+    mov r15, 1
+    mov ecx, r12d
+    shl r15, cl
+
+    mov rax, [buddy_pmm_pool_phys]
+    shr rax, PAGE_SHIFT
+    add rax, r15
+    cmp rax, r14
+    ja .bitmap
+
+    mov rcx, r12
+    call buddy_pmm_alloc
+    test rax, rax
+    jnz .done
+
+.bitmap:
+    ; Fallback to bitmap allocator, restricted by zone limit
+    mov r13, 1
+    mov ecx, r12d
+    shl r13, cl
+
+    cmp r13, r14
+    ja .fail
+
+    cmp qword [boot_info + BootInfo.pmm_free_pages], 0
+    je .fail
+
+    cmp r13, [boot_info + BootInfo.pmm_free_pages]
+    ja .fail
+
+    xor r15, r15
+
+.next_start:
+    mov rax, r15
+    add rax, r13
+    cmp rax, r14
+    ja .fail
+
+    mov rcx, r15
+    mov rdx, r13
+    call pmm_range_free
+    test eax, eax
+    jnz .found
+
+    add r15, r13
+    jmp .next_start
+
+.found:
+    mov rcx, r15
+    mov rdx, r13
+    call pmm_set_range
+
+    sub qword [boot_info + BootInfo.pmm_free_pages], r13
+
+    mov rax, r15
+    shl rax, PAGE_SHIFT
+
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.fail:
+    xor eax, eax
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 mm_alloc_order_flags:
     push r12
     push r13
     push r14
     push r15
 
-    mov r12, rcx
-    mov r13, rdx
+    mov r12, rcx        ; order
+    mov r13, rdx        ; flags
 
-    call pmm_alloc_order
+    call pmm_alloc_order_flags
     test rax, rax
     jz .done
 
@@ -5032,6 +5190,717 @@ buddy_pmm_test:
     pop r12
     ret
 
+zonetest:
+    push r12
+    push r13
+    push r14
+
+    lea r9, [msg_zonetest_v1]
+    call draw_text
+
+    call buddy_pmm_init
+    test eax, eax
+    jnz .fail
+
+    ; Normal allocation, order 2
+    mov rcx, 2
+    xor rdx, rdx
+    call pmm_alloc_order_flags
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov qword [r12], 0x1000
+    cmp qword [r12], 0x1000
+    jne .fail
+
+    mov rcx, r12
+    mov rdx, 2
+    call pmm_free_order_flags
+
+    ; DMA32 allocation, order 2
+    mov rcx, 2
+    mov rdx, MM_FLAG_DMA32
+    call pmm_alloc_order_flags
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov r13, [zone_dma32_limit_val]
+    cmp r12, r13
+    jae .fail
+
+    mov qword [r12], 0x2000
+    cmp qword [r12], 0x2000
+    jne .fail
+
+    mov rcx, r12
+    mov rdx, 2
+    call pmm_free_order_flags
+
+    ; DMA allocation, order 0
+    mov rcx, 0
+    mov rdx, MM_FLAG_DMA
+    call pmm_alloc_order_flags
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+	mov r13, [zone_dma_limit_val]
+    cmp r12, r13
+    jae .fail
+
+    mov qword [r12], 0x3000
+    cmp qword [r12], 0x3000
+    jne .fail
+
+    mov rcx, r12
+    mov rdx, 0
+    call pmm_free_order_flags
+
+    lea r9, [msg_zonetest_ok]
+    call draw_text
+
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+.fail:
+    lea r9, [msg_zonetest_fail]
+    call draw_text
+
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+;================ Slab Allocator =================
+
+slab_cache_index:
+    ; input:
+    ; rcx = size
+    ;
+    ; output:
+    ; rax = cache index, or SLAB_CACHE_COUNT if too large
+
+    xor eax, eax
+
+.loop:
+    cmp rax, SLAB_CACHE_COUNT
+    jae .done
+
+    cmp rcx, [slab_sizes + rax*8]
+    jbe .done
+
+    inc rax
+    jmp .loop
+
+.done:
+    ret
+
+slab_refill:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    mov r12, rcx        ; cache index
+
+    ; Allocate one page for this slab
+    mov rcx, 0
+    xor rdx, rdx
+    call pmm_alloc_order_flags
+    test rax, rax
+    jz .fail
+
+    mov r14, rax        ; page address
+    mov r13, [slab_sizes + r12*8]
+
+    ; object count = PAGE_SIZE / object_size
+    mov rax, PAGE_SIZE
+    xor edx, edx
+    div r13
+
+    mov rcx, rax        ; count
+    mov rdx, r14        ; current object
+
+.push_loop:
+    test rcx, rcx
+    jz .ok
+
+    mov rax, [slab_free_heads + r12*8]
+    mov [rdx], rax
+    mov [slab_free_heads + r12*8], rdx
+
+    add rdx, r13
+    dec rcx
+    jmp .push_loop
+
+.ok:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.fail:
+    mov eax, 1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+slab_alloc:
+    push rbx
+    push r12
+    push r13
+
+    mov r12, rcx        ; size
+
+    call slab_cache_index
+    cmp rax, SLAB_CACHE_COUNT
+    jae .fail
+
+    mov r12, rax        ; cache index
+
+.retry:
+    mov rax, [slab_free_heads + r12*8]
+    test rax, rax
+    jnz .got
+
+    mov rcx, r12
+    call slab_refill
+    test eax, eax
+    jnz .fail
+
+    mov rax, [slab_free_heads + r12*8]
+    test rax, rax
+    jnz .got
+    jmp .fail
+
+.got:
+    mov rbx, [rax]
+    mov [slab_free_heads + r12*8], rbx
+
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.fail:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+slab_free:
+    push rax
+    push r12
+    push r13
+
+    mov r12, rcx        ; size
+    mov r13, rdx        ; pointer
+
+    test r13, r13
+    jz .done
+
+    mov rcx, r12
+    call slab_cache_index
+    cmp rax, SLAB_CACHE_COUNT
+    jae .done
+
+    mov rcx, [slab_free_heads + rax*8]
+    mov [r13], rcx
+    mov [slab_free_heads + rax*8], r13
+
+.done:
+    pop r13
+    pop r12
+    pop rax
+    ret
+
+slabtest:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    lea r9, [msg_slabtest_v1]
+    call draw_text
+
+    lea rbx, [slab_test_ptrs]
+
+    xor r15, r15
+
+.alloc16:
+    mov rcx, 16
+    call slab_alloc
+    test rax, rax
+    jz .fail
+
+    mov [rbx + r15*8], rax
+    mov byte [rax], 0x5A
+
+    inc r15
+    cmp r15, SLAB_TEST_COUNT
+    jb .alloc16
+
+    xor r15, r15
+
+.free16:
+    mov r12, [rbx + r15*8]
+
+    cmp byte [r12], 0x5A
+    jne .fail
+
+    mov rcx, 16
+    mov rdx, r12
+    call slab_free
+
+    inc r15
+    cmp r15, SLAB_TEST_COUNT
+    jb .free16
+
+    ; Bigger size classes
+    mov rcx, 32
+    call slab_alloc
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov rcx, 64
+    call slab_alloc
+    test rax, rax
+    jz .fail
+    mov r13, rax
+
+    mov rcx, 128
+    call slab_alloc
+    test rax, rax
+    jz .fail
+    mov r14, rax
+
+    mov rcx, 256
+    call slab_alloc
+    test rax, rax
+    jz .fail
+    mov r15, rax
+
+    cmp r12, r13
+    je .fail
+    cmp r12, r14
+    je .fail
+    cmp r12, r15
+    je .fail
+    cmp r13, r14
+    je .fail
+    cmp r13, r15
+    je .fail
+    cmp r14, r15
+    je .fail
+
+    mov qword [r12], 0x1111
+    mov qword [r13], 0x2222
+    mov qword [r14], 0x3333
+    mov qword [r15], 0x4444
+
+    cmp qword [r12], 0x1111
+    jne .fail
+    cmp qword [r13], 0x2222
+    jne .fail
+    cmp qword [r14], 0x3333
+    jne .fail
+    cmp qword [r15], 0x4444
+    jne .fail
+
+    mov rcx, 256
+    mov rdx, r15
+    call slab_free
+
+    mov rcx, 128
+    mov rdx, r14
+    call slab_free
+
+    mov rcx, 64
+    mov rdx, r13
+    call slab_free
+
+    mov rcx, 32
+    mov rdx, r12
+    call slab_free
+
+    lea r9, [msg_slabtest_ok]
+    call draw_text
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.fail:
+    lea r9, [msg_slabtest_fail]
+    call draw_text
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+;================ Higher-Half VMM =================
+
+vmm_map_2mb_pml4:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rbx, rcx        ; pml4 physical
+    mov r12, rdx        ; virtual address
+    mov r13, r8         ; physical address
+    mov r15, r9         ; flags
+
+    ; PML4
+    mov rax, r12
+    shr rax, 39
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+
+    mov rax, [rbx + r14 * 8]
+    test al, PAGE_PRESENT
+    jnz .pdpt_ready
+
+    call pmm_alloc_page
+    test rax, rax
+    jz .oom
+
+    mov rcx, rax
+    call zero_page
+
+    or rax, PAGE_PRESENT | PAGE_WRITABLE
+    mov [rbx + r14 * 8], rax
+
+.pdpt_ready:
+    mov rax, [rbx + r14 * 8]
+    MASK_FRAME rax
+    mov rbx, rax
+
+    ; PDPT
+    mov rax, r12
+    shr rax, 30
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+
+    mov rax, [rbx + r14 * 8]
+    test al, PAGE_PRESENT
+    jnz .pd_ready
+
+    call pmm_alloc_page
+    test rax, rax
+    jz .oom
+
+    mov rcx, rax
+    call zero_page
+
+    or rax, PAGE_PRESENT | PAGE_WRITABLE
+    mov [rbx + r14 * 8], rax
+
+.pd_ready:
+    mov rax, [rbx + r14 * 8]
+    MASK_FRAME rax
+    mov rbx, rax
+
+    ; PD
+    mov rax, r12
+    shr rax, 21
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+
+    mov rax, [rbx + r14 * 8]
+    test al, PAGE_PRESENT
+    jz .install
+
+    test al, PAGE_SIZE_FLAG
+    jz .conflict
+
+.install:
+    mov rax, r13
+    or rax, r15
+    or rax, PAGE_PRESENT | PAGE_SIZE_FLAG
+    mov [rbx + r14 * 8], rax
+
+    xor eax, eax
+    jmp .done
+
+.conflict:
+    mov eax, 1
+    jmp .done
+
+.oom:
+    mov eax, 2
+
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+phys_to_virt:
+    mov rax, [phys_map_base_val]
+    add rax, rcx
+    ret
+
+hh_init:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rsi
+    push rdi
+
+    cmp byte [hh_active], 1
+    je .ok
+
+    ; Allocate new PML4
+    call pmm_alloc_page
+    test rax, rax
+    jz .fail
+
+    mov r12, rax
+    mov rcx, rax
+    call zero_page
+
+    ; Copy current PML4
+    mov rsi, [pml4_ptr]
+    test rsi, rsi
+    jnz .copy_pml4
+
+    mov rsi, cr3
+    and rsi, -4096
+
+.copy_pml4:
+    cld
+    mov rdi, r12
+    mov rcx, 512
+    rep movsq
+
+    mov [hh_pml4_phys], r12
+
+    ; Map usable physical memory into higher-half direct map
+    mov rsi, [boot_info + BootInfo.mem_map]
+    test rsi, rsi
+    jz .map_buddy_pool
+
+    mov r15, [boot_info + BootInfo.mem_size]
+    test r15, r15
+    jz .map_buddy_pool
+
+    mov rbx, [boot_info + BootInfo.mem_desc_size]
+    test rbx, rbx
+    jz .map_buddy_pool
+
+.map_scan:
+    cmp r15, rbx
+    jb .map_buddy_pool
+
+    mov eax, [rsi]
+
+    cmp eax, MEM_TYPE_CONVENTIONAL
+    je .map_this
+
+    cmp eax, MEM_TYPE_LOADER_DATA
+    je .map_this
+
+    cmp eax, MEM_TYPE_BS_DATA
+    je .map_this
+
+    cmp eax, MEM_TYPE_BS_CODE
+    je .map_this
+
+    cmp eax, MEM_TYPE_LOADER_CODE
+    je .map_this
+
+    jmp .next_desc
+
+.map_this:
+    mov r13, [rsi + 8]
+    mov rdx, [rsi + 24]
+
+    test rdx, rdx
+    jz .next_desc
+
+    shl rdx, PAGE_SHIFT
+
+    mov r14, r13
+    add r14, rdx
+
+    and r13, -VMM_2MB_PAGE_SIZE
+
+    add r14, VMM_2MB_PAGE_SIZE - 1
+    and r14, -VMM_2MB_PAGE_SIZE
+
+    cmp r13, [hh_direct_map_limit_val]
+    jae .next_desc
+
+    cmp r14, [hh_direct_map_limit_val]
+    jbe .cap_ok
+
+    mov r14, [hh_direct_map_limit_val]
+
+.cap_ok:
+    cmp r13, r14
+    jae .next_desc
+
+.map_region:
+    cmp r13, r14
+    jae .next_desc
+
+    mov rcx, r12
+
+    mov rdx, [phys_map_base_val]
+    add rdx, r13
+
+    mov r8, r13
+    mov r9, PAGE_WRITABLE
+    call vmm_map_2mb_pml4
+
+    test rax, rax
+    jz .map_next
+
+    cmp rax, 2
+    je .fail
+
+.map_next:
+    add r13, VMM_2MB_PAGE_SIZE
+    jmp .map_region
+
+.next_desc:
+    add rsi, rbx
+    sub r15, rbx
+    jmp .map_scan
+
+.map_buddy_pool:
+    mov rax, [buddy_pmm_pool_phys]
+    test rax, rax
+    jz .ok
+
+    cmp rax, [hh_direct_map_limit_val]
+    jae .ok
+
+    mov r13, rax
+
+    mov rcx, r12
+
+    mov rdx, [phys_map_base_val]
+    add rdx, r13
+
+    mov r8, r13
+    mov r9, PAGE_WRITABLE
+    call vmm_map_2mb_pml4
+
+.ok:
+    mov byte [hh_active], 1
+    xor eax, eax
+
+    pop rdi
+    pop rsi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.fail:
+    mov eax, 1
+
+    pop rdi
+    pop rsi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+hh_activate:
+    mov rax, [hh_pml4_phys]
+    test rax, rax
+    jz .done
+
+    mov cr3, rax
+
+.done:
+    ret
+
+hhvmm_test:
+    push r12
+    push r13
+    push r14
+
+    lea r9, [msg_hhvmm_v1]
+    call draw_text
+
+    call hh_init
+    test eax, eax
+    jnz .fail
+
+    call hh_activate
+
+    ; Allocate a page below 4GiB
+    mov rcx, 0
+    mov rdx, MM_FLAG_DMA32
+    call pmm_alloc_order_flags
+    test rax, rax
+    jz .fail
+
+    mov r12, rax
+
+    mov r13, [phys_map_base_val]
+    add r13, r12
+
+    mov qword [r13], 0x0BADF00D
+    cmp qword [r13], 0x0BADF00D
+    jne .fail
+
+    mov rcx, r12
+    call phys_to_virt
+    cmp rax, r13
+    jne .fail
+
+    mov rcx, r12
+    mov rdx, 0
+    call pmm_free_order_flags
+
+    lea r9, [msg_hhvmm_ok]
+    call draw_text
+
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+.fail:
+    lea r9, [msg_hhvmm_fail]
+    call draw_text
+
+    pop r14
+    pop r13
+    pop r12
+    ret
+
 cmd_execute:
     cmp qword [cmd_len], 0
     je .done
@@ -5120,6 +5989,21 @@ cmd_execute:
     call cmd_is
     test eax, eax
     jnz .bpmm
+
+    lea rsi, [str_cmd_zonetest]
+    call cmd_is
+    test eax, eax
+    jnz .zonetest
+
+    lea rsi, [str_cmd_slabtest]
+    call cmd_is
+    test eax, eax
+    jnz .slabtest
+
+    lea rsi, [str_cmd_hhvmm]
+    call cmd_is
+    test eax, eax
+    jnz .hhvmm
 
     lea rsi, [str_cmd_exit]
     call cmd_is
@@ -5447,6 +6331,18 @@ cmd_execute:
     call buddy_pmm_test
     ret
 
+.zonetest:
+    call zonetest
+    ret
+
+.slabtest:
+    call slabtest
+    ret
+
+.hhvmm:
+    call hhvmm_test
+    ret
+
 .exit:
     jmp exit_boot_services_sequence
 
@@ -5756,6 +6652,9 @@ msg_help:
     db "  buddyarena  - test real buddy arena",10
     db "  buddystress - stress buddy allocator",10
     db "  bpmm        - test Buddy PMM",10
+    db "  zonetest    - test Zones/DMA",10
+    db "  slabtest    - test Slab allocator",10
+    db "  hhvmm       - test Higher-Half VMM",10
     db "  kernel      - enter kernel",10
     db "  exit        - exit boot services",10
     db 0
@@ -6023,6 +6922,70 @@ buddy_pmm_heads:
 align 16
 buddy_pmm_pool_raw:
     times (2 * BUDDY_PMM_BLOCK_SIZE) db 0
+
+str_cmd_zonetest:
+    db "zonetest",0
+
+msg_zonetest_v1:
+    db "Zones/DMA test",10,0
+
+msg_zonetest_ok:
+    db "Zones/DMA: OK",10,0
+
+msg_zonetest_fail:
+    db "Zones/DMA: FAIL",10,0
+
+slab_sizes:
+    dq 16, 32, 64, 128, 256, 512, 1024, 2048
+
+slab_free_heads:
+    times SLAB_CACHE_COUNT dq 0
+
+slab_test_ptrs:
+    times SLAB_TEST_COUNT dq 0
+
+str_cmd_slabtest:
+    db "slabtest",0
+
+msg_slabtest_v1:
+    db "Slab allocator test",10,0
+
+msg_slabtest_ok:
+    db "Slab allocator: OK",10,0
+
+msg_slabtest_fail:
+    db "Slab allocator: FAIL",10,0
+
+hh_active:
+    db 0
+
+hh_pml4_phys:
+    dq 0
+
+str_cmd_hhvmm:
+    db "hhvmm",0
+
+msg_hhvmm_v1:
+    db "Higher-Half VMM test",10,0
+
+msg_hhvmm_ok:
+    db "Higher-Half VMM: OK",10,0
+
+msg_hhvmm_fail:
+    db "Higher-Half VMM: FAIL",10,0
+
+align 8
+phys_map_base_val:
+    dq PHYS_MAP_BASE
+
+hh_direct_map_limit_val:
+    dq HH_DIRECT_MAP_LIMIT
+
+zone_dma_limit_val:
+    dq ZONE_DMA_LIMIT
+
+zone_dma32_limit_val:
+    dq ZONE_DMA32_LIMIT
 
 font_table:
     db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
