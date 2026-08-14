@@ -105,6 +105,15 @@ global _e
 %define MM_FLAG_DMA    2
 %define MM_FLAG_DMA32  4
 
+%define PMM_ORDER_CACHE_MAX 16
+%define BUDDY_ARENA_ORDER_MAX 9
+%define BUDDY_ARENA_ORDER_MIN 2
+
+%define BUDDY_STATIC_ORDER 7
+%define BUDDY_STATIC_BLOCK_SIZE (1 << (PAGE_SHIFT + BUDDY_STATIC_ORDER))
+%define BUDDY_PMM_ORDER 9
+%define BUDDY_PMM_BLOCK_SIZE (1 << (PAGE_SHIFT + BUDDY_PMM_ORDER))
+
 %macro MASK_FRAME 1
     shl %1, 12
     shr %1, 12
@@ -1957,6 +1966,133 @@ pmm_set_range:
     pop r10
     ret
 
+pmm_range_used:
+    push rbx
+    push r10
+    push r11
+    push r12
+    push rcx
+    push rdx
+
+    mov r10, [boot_info + BootInfo.pmm_bitmap]
+    test r10, r10
+    jz .fail
+
+    mov r11, rcx
+    mov r12, rdx
+
+    mov eax, 1
+
+    test r12, r12
+    jz .done
+
+.check:
+    mov rcx, r11
+    shr rcx, 6
+
+    mov rdx, r11
+    and edx, 63
+
+    bt qword [r10 + rcx*8], rdx
+    jnc .fail
+
+    inc r11
+    dec r12
+    jnz .check
+
+.done:
+    pop rdx
+    pop rcx
+    pop r12
+    pop r11
+    pop r10
+    pop rbx
+    ret
+
+.fail:
+    xor eax, eax
+    pop rdx
+    pop rcx
+    pop r12
+    pop r11
+    pop r10
+    pop rbx
+    ret
+
+pmm_order_cache_push:
+    xor eax, eax
+
+    cmp rcx, PMM_ORDER_MAX
+    ja .ret
+
+    test rcx, rcx
+    jz .ret
+
+    mov r8, [pmm_order_counts + rcx*8]
+
+    xor r9, r9
+
+.dup_loop:
+    cmp r9, r8
+    jae .dup_done
+
+    mov r10, rcx
+    imul r10, PMM_ORDER_CACHE_MAX
+    add r10, r9
+
+    mov r11, [pmm_order_cache + r10*8]
+    cmp r11, rdx
+    je .duplicate
+
+    inc r9
+    jmp .dup_loop
+
+.duplicate:
+    mov eax, 2
+    jmp .ret
+
+.dup_done:
+    cmp r8, PMM_ORDER_CACHE_MAX
+    jae .ret
+
+    mov r10, rcx
+    imul r10, PMM_ORDER_CACHE_MAX
+    add r10, r8
+
+    mov [pmm_order_cache + r10*8], rdx
+
+    inc qword [pmm_order_counts + rcx*8]
+
+    mov eax, 1
+
+.ret:
+    ret
+
+pmm_order_cache_pop:
+    xor eax, eax
+
+    cmp rcx, PMM_ORDER_MAX
+    ja .done
+
+    test rcx, rcx
+    jz .done
+
+    mov rdx, [pmm_order_counts + rcx*8]
+    test rdx, rdx
+    jz .done
+
+    dec rdx
+    mov [pmm_order_counts + rcx*8], rdx
+
+    mov rax, rcx
+    imul rax, PMM_ORDER_CACHE_MAX
+    add rax, rdx
+
+    mov rax, [pmm_order_cache + rax*8]
+
+.done:
+    ret
+
 pmm_alloc_order:
     push rbx
     push r12
@@ -1970,10 +2106,17 @@ pmm_alloc_order:
     ja .fail
 
     test r12, r12
-    jnz .order_scan
+    jnz .order_cache_try
 
     call pmm_alloc_page
     jmp .done
+
+.order_cache_try:
+    mov rcx, r12
+    call pmm_order_cache_pop
+
+    test rax, rax
+    jnz .done
 
 .order_scan:
     cmp qword [boot_info + BootInfo.pmm_free_pages], 0
@@ -2032,6 +2175,8 @@ pmm_free_order:
     push rbx
     push r12
     push r13
+    push r14
+    push r15
 
     mov r12, rcx
     mov r13, rdx
@@ -2051,38 +2196,60 @@ pmm_free_order:
     mov rax, 1
     mov ecx, r13d
     shl rax, cl
-    mov rbx, rax
+    mov r14, rax
 
-    mov rax, rbx
+    mov rax, r14
     shl rax, PAGE_SHIFT
     dec rax
     test r12, rax
     jnz .done
 
-    mov rcx, r12
-    shr rcx, PAGE_SHIFT
+    mov r15, r12
+    shr r15, PAGE_SHIFT
 
-    mov rax, rcx
-    add rax, rbx
+    mov rax, r15
+    add rax, r14
     cmp rax, [boot_info + BootInfo.pmm_total_pages]
     ja .done
 
-    mov rdx, rcx
-    add rdx, rbx
+    mov rcx, r15
+    mov rdx, r14
+    call pmm_range_used
+    test eax, eax
+    jz .done
+
+    mov rcx, r13
+    mov rdx, r12
+    call pmm_order_cache_push
+
+    test eax, eax
+    jnz .done
+
+    mov rcx, r15
+    mov rdx, r15
+    add rdx, r14
     call pmm_clear_range
 
-    add qword [boot_info + BootInfo.pmm_free_pages], rbx
-    jmp .done
+    add qword [boot_info + BootInfo.pmm_free_pages], r14
 
-.order0:
-    mov rcx, r12
-    call pmm_free_page
+    mov rax, r15
+    shr rax, 6
+    cmp rax, [pmm_next_word]
+    jae .done
+    mov [pmm_next_word], rax
 
 .done:
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
     ret
+
+.order0:
+    mov rcx, r12
+    call pmm_free_page
+    jmp .done
 
 mem_alloc:
     test rcx, rcx
@@ -2123,15 +2290,14 @@ vmm_map_2mb:
     push r14
     push r15
 
-    mov r12, rcx        ; virtual address
-    mov r13, rdx        ; physical address
-    mov r15, r8         ; flags
+    mov r12, rcx
+    mov r13, rdx
+    mov r15, r8
 
     mov rbx, [pml4_ptr]
     test rbx, rbx
     jz .oom
 
-    ; PML4 -> PDPT
     mov rax, r12
     shr rax, 39
     and eax, PT_INDEX_BITS
@@ -2156,7 +2322,6 @@ vmm_map_2mb:
     MASK_FRAME rax
     mov rbx, rax
 
-    ; PDPT -> PD
     mov rax, r12
     shr rax, 30
     and eax, PT_INDEX_BITS
@@ -2181,7 +2346,6 @@ vmm_map_2mb:
     MASK_FRAME rax
     mov rbx, rax
 
-    ; install 2MB page
     mov rax, r12
     shr rax, 21
     and eax, PT_INDEX_BITS
@@ -2375,7 +2539,6 @@ vmm_map_4k:
     test rbx, rbx
     jz .oom
 
-    ; PML4 -> PDPT
     mov rax, r12
     shr rax, 39
     and eax, PT_INDEX_BITS
@@ -2400,7 +2563,6 @@ vmm_map_4k:
     MASK_FRAME rax
     mov rbx, rax
 
-    ; PDPT -> PD
     mov rax, r12
     shr rax, 30
     and eax, PT_INDEX_BITS
@@ -2430,7 +2592,6 @@ vmm_map_4k:
     MASK_FRAME rax
     mov rbx, rax
 
-    ; PD -> PT
     mov rax, r12
     shr rax, 21
     and eax, PT_INDEX_BITS
@@ -2455,8 +2616,6 @@ vmm_map_4k:
     test al, PAGE_SIZE_FLAG
     jz .pt_table
 
-    ;================ split 2MB page =================
-
     push rax
 
     call pmm_alloc_page
@@ -2468,8 +2627,6 @@ vmm_map_4k:
     call zero_page
 
     pop r9
-
-    ; r9 = original 2MB PDE
 
     mov r8, PAGE_PRESENT
 
@@ -2484,14 +2641,12 @@ vmm_map_4k:
 
 .split_no_u:
 
-    ; physical base of original 2MB page
     mov rax, r9
     shl rax, 12
     shr rax, 12
     and rax, -VMM_2MB_PAGE_SIZE
     mov r10, rax
 
-    ; fill 512 x 4KB entries
     xor ecx, ecx
 
 .split_fill:
@@ -2506,7 +2661,6 @@ vmm_map_4k:
     cmp ecx, 512
     jb .split_fill
 
-    ; replace 2MB PDE with PT pointer
     mov rax, r11
     or rax, PAGE_PRESENT | PAGE_WRITABLE
 
@@ -2819,6 +2973,174 @@ isr_stub_table:
     %error "isr_stub_table does not have exactly 32 entries"
 %endif
 
+;================ minimal IDT / panic =================
+
+isr_common:
+    cli
+
+    mov rcx, [rsp]
+    mov rdx, [rsp + 8]
+    mov r8, [rsp + 16]
+
+    mov rax, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    call panic_exception
+
+panic_exception:
+    cli
+
+    push r15
+    push r14
+    push r13
+
+    mov r15, rcx
+    mov r14, rdx
+    mov r13, r8
+
+    mov qword [video + Video.fg], 0x00FF5A5A
+    mov qword [video + Video.bg], 0x00140000
+    mov byte [cursor_shown], 0
+
+    call console_clear
+
+    mov rax, [margin_x]
+    mov [video + Video.cx], rax
+    mov qword [video + Video.cy], START_Y
+
+    call ensure_y
+
+    lea r9, [str_panic_banner]
+    call draw_text
+
+    lea r9, [str_vector]
+    call draw_text
+    mov rcx, r15
+    call print_hex64
+
+    lea r9, [str_error]
+    call draw_text
+    mov rcx, r14
+    call print_hex64
+
+    lea r9, [str_rip]
+    call draw_text
+    mov rcx, r13
+    call print_hex64
+
+    lea r9, [str_halted]
+    call draw_text
+
+.halt:
+    cli
+    hlt
+    jmp .halt
+
+print_hex64:
+    push rbx
+    push r13
+    push r14
+
+    mov r13, rcx
+    lea rbx, [hex_digits]
+    mov r14, 64
+
+.digit_loop:
+    sub r14, 4
+
+    mov rax, r13
+    mov ecx, r14d
+    shr rax, cl
+    and eax, 0x0F
+
+    movzx r9d, byte [rbx + rax]
+    call console_putc
+
+    test r14, r14
+    jnz .digit_loop
+
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+idt_init_minimal:
+    push rbx
+    push r12
+    push r13
+    push rsi
+    push rdi
+
+    cld
+
+    sidt [old_idtr_limit]
+
+    lea rdi, [idt]
+    xor eax, eax
+    mov rcx, (256 * 16) / 8
+    rep stosq
+
+    movzx ecx, word [old_idtr_limit]
+    inc rcx
+
+    cmp rcx, 256 * 16
+    jbe .copy_ok
+
+    mov rcx, 256 * 16
+
+.copy_ok:
+    mov rsi, [old_idtr_base]
+    test rsi, rsi
+    jz .no_copy
+
+    lea rdi, [idt]
+    rep movsb
+
+.no_copy:
+    mov ax, cs
+    movzx r12, ax
+
+    xor r13, r13
+
+.fill_loop:
+    lea rbx, [isr_stub_table]
+    movsxd rax, dword [rbx + r13 * 4]
+    lea rax, [rbx + rax]
+
+    lea rdi, [idt]
+    mov rcx, r13
+    imul rcx, 16
+    add rdi, rcx
+
+    mov word [rdi + 0], ax
+    mov word [rdi + 2], r12w
+    mov byte [rdi + 4], 0
+    mov byte [rdi + 5], 0x8E
+
+    shr rax, 16
+    mov word [rdi + 6], ax
+
+    shr rax, 16
+    mov dword [rdi + 8], eax
+    mov dword [rdi + 12], 0
+
+    inc r13
+    cmp r13, 32
+    jb .fill_loop
+
+    lea rax, [idt]
+    mov [new_idtr_base], rax
+
+    lidt [new_idtr_limit]
+
+    pop rdi
+    pop rsi
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 kheap_init:
     push rbx
     push r12
@@ -3115,8 +3437,6 @@ heap_test:
     call draw_text
     ret    
 
-;================ stable mm API =================
-
 mm_alloc_page:
     jmp pmm_alloc_page
 
@@ -3241,8 +3561,8 @@ mm_alloc_order_flags:
     push r14
     push r15
 
-    mov r12, rcx        ; order
-    mov r13, rdx        ; flags
+    mov r12, rcx
+    mov r13, rdx
 
     call pmm_alloc_order
     test rax, rax
@@ -3331,170 +3651,78 @@ mm_flags_test:
     call draw_text
     ret
 
-isr_common:
-    cli
-
-    mov rcx, [rsp]
-    mov rdx, [rsp + 8]
-    mov r8, [rsp + 16]
-
-    mov rax, rsp
-    and rsp, -16
-    sub rsp, 32
-
-    call panic_exception
-
-panic_exception:
-    cli
-
-    push r15
-    push r14
-    push r13
-
-    mov r15, rcx
-    mov r14, rdx
-    mov r13, r8
-
-    mov qword [video + Video.fg], 0x00FF5A5A
-    mov qword [video + Video.bg], 0x00140000
-    mov byte [cursor_shown], 0
-
-    call console_clear
-
-    mov rax, [margin_x]
-    mov [video + Video.cx], rax
-    mov qword [video + Video.cy], START_Y
-
-    call ensure_y
-
-    lea r9, [str_panic_banner]
-    call draw_text
-
-    lea r9, [str_vector]
-    call draw_text
-    mov rcx, r15
-    call print_hex64
-
-    lea r9, [str_error]
-    call draw_text
-    mov rcx, r14
-    call print_hex64
-
-    lea r9, [str_rip]
-    call draw_text
-    mov rcx, r13
-    call print_hex64
-
-    lea r9, [str_halted]
-    call draw_text
-
-.halt:
-    cli
-    hlt
-    jmp .halt
-
-print_hex64:
-    push rbx
-    push r13
-    push r14
-
-    mov r13, rcx
-    lea rbx, [hex_digits]
-    mov r14, 64
-
-.digit_loop:
-    sub r14, 4
-
-    mov rax, r13
-    mov ecx, r14d
-    shr rax, cl
-    and eax, 0x0F
-
-    movzx r9d, byte [rbx + rax]
-    call console_putc
-
-    test r14, r14
-    jnz .digit_loop
-
-    pop r14
-    pop r13
-    pop rbx
-    ret
-
-idt_init_minimal:
-    push rbx
+buddy_test:
     push r12
     push r13
-    push rsi
-    push rdi
 
-    cld
+    mov rcx, 1
+    call pmm_alloc_order
+    test rax, rax
+    jz .fail
+    mov r12, rax
 
-    sidt [old_idtr_limit]
+    mov rcx, 2
+    call pmm_alloc_order
+    test rax, rax
+    jz .fail_free_order1
+    mov r13, rax
 
-    lea rdi, [idt]
-    xor eax, eax
-    mov rcx, (256 * 16) / 8
-    rep stosq
+    cmp r12, r13
+    je .fail_free_order2
 
-    movzx ecx, word [old_idtr_limit]
-    inc rcx
+    mov qword [r12], 0x1234
+    mov qword [r13], 0x5678
 
-    cmp rcx, 256 * 16
-    jbe .copy_ok
+    cmp qword [r12], 0x1234
+    jne .fail_free_order2
 
-    mov rcx, 256 * 16
+    cmp qword [r13], 0x5678
+    jne .fail_free_order2
 
-.copy_ok:
-    mov rsi, [old_idtr_base]
-    test rsi, rsi
-    jz .no_copy
-
-    lea rdi, [idt]
-    rep movsb
-
-.no_copy:
-    mov ax, cs
-    movzx r12, ax
-
-    xor r13, r13
-
-.fill_loop:
-    lea rbx, [isr_stub_table]
-    movsxd rax, dword [rbx + r13 * 4]
-    lea rax, [rbx + rax]
-
-    lea rdi, [idt]
     mov rcx, r13
-    imul rcx, 16
-    add rdi, rcx
+    mov rdx, 2
+    call pmm_free_order
 
-    mov word [rdi + 0], ax
-    mov word [rdi + 2], r12w
-    mov byte [rdi + 4], 0
-    mov byte [rdi + 5], 0x8E
+    mov rcx, 2
+    call pmm_alloc_order
+    test rax, rax
+    jz .fail_free_order1
 
-    shr rax, 16
-    mov word [rdi + 6], ax
+    mov rcx, rax
+    mov rdx, 2
+    call pmm_free_order
 
-    shr rax, 16
-    mov dword [rdi + 8], eax
-    mov dword [rdi + 12], 0
+    mov rcx, r12
+    mov rdx, 1
+    call pmm_free_order
 
-    inc r13
-    cmp r13, 32
-    jb .fill_loop
+    mov rcx, r12
+    mov rdx, 1
+    call pmm_free_order
 
-    lea rax, [idt]
-    mov [new_idtr_base], rax
-
-    lidt [new_idtr_limit]
-
-    pop rdi
-    pop rsi
     pop r13
     pop r12
-    pop rbx
+
+    lea r9, [msg_buddytest_ok]
+    call draw_text
+    ret
+
+.fail_free_order2:
+    mov rcx, r13
+    mov rdx, 2
+    call pmm_free_order
+
+.fail_free_order1:
+    mov rcx, r12
+    mov rdx, 1
+    call pmm_free_order
+
+.fail:
+    pop r13
+    pop r12
+
+    lea r9, [msg_buddytest_fail]
+    call draw_text
     ret
 
 cmd_append_char:
@@ -3586,6 +3814,1224 @@ cmd_is:
     xor eax, eax
     ret
 
+buddy_push:
+    lea r8, [buddy_free_heads]
+    mov r9, [r8 + rcx*8]
+
+    mov [rdx], r9
+    mov [r8 + rcx*8], rdx
+
+    ret
+
+buddy_pop:
+    lea rdx, [buddy_free_heads]
+    mov rax, [rdx + rcx*8]
+
+    test rax, rax
+    jz .done
+
+    mov r9, [rax]
+    mov [rdx + rcx*8], r9
+
+.done:
+    ret
+
+buddy_contains:
+    push r9
+
+    lea r9, [buddy_free_heads]
+    mov rax, [r9 + rcx*8]
+
+.loop:
+    test rax, rax
+    jz .no
+
+    cmp rax, rdx
+    je .yes
+
+    mov rax, [rax]
+    jmp .loop
+
+.yes:
+    mov eax, 1
+    pop r9
+    ret
+
+.no:
+    xor eax, eax
+    pop r9
+    ret
+
+buddy_remove:
+    push r9
+    push r10
+
+    lea r9, [buddy_free_heads]
+    lea r10, [r9 + rcx*8]
+
+.loop:
+    mov rax, [r10]
+
+    test rax, rax
+    jz .no
+
+    cmp rax, rdx
+    je .found
+
+    mov r10, rax
+    jmp .loop
+
+.found:
+    mov rax, [rax]
+    mov [r10], rax
+
+    mov eax, 1
+    pop r10
+    pop r9
+    ret
+
+.no:
+    xor eax, eax
+    pop r10
+    pop r9
+    ret
+
+buddy_pool_fallback:
+    push r12
+
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .fail
+
+    mov rax, [rbx + BS_ALLOCATE_POOL]
+    test rax, rax
+    jz .fail
+
+    mov ecx, EFI_LOADER_DATA
+    mov rdx, 0x8000
+    lea r8, [buddy_fallback_alloc]
+
+    call rax
+
+    test rax, rax
+    jnz .fail
+
+    xor eax, eax
+    jmp .done
+
+.fail:
+    mov eax, 1
+
+.done:
+    mov rsp, r12
+    pop r12
+    ret
+
+buddy_reset:
+    push rdi
+    push rcx
+    push rax
+
+    cmp byte [buddy_arena_active], 1
+    jne .clear_only
+
+    cmp byte [buddy_arena_from_pmm], 1
+    jne .clear_only
+
+    mov rcx, [buddy_arena_base]
+    mov rdx, [buddy_arena_order]
+    call pmm_free_order
+
+.clear_only:
+    cld
+    lea rdi, [buddy_free_heads]
+    xor eax, eax
+    mov ecx, BUDDY_ARENA_ORDER_MAX + 1
+    rep stosq
+
+    mov byte [buddy_arena_active], 0
+    mov byte [buddy_arena_from_pmm], 0
+    mov qword [buddy_arena_order], 0
+    mov qword [buddy_arena_base], 0
+
+    pop rax
+    pop rcx
+    pop rdi
+    ret
+
+buddy_init:
+    push rbx
+    push r12
+    push r13
+    push rdi
+    push rcx
+    push rax
+
+    cmp byte [buddy_arena_active], 1
+    je .ok
+
+    cld
+    lea rdi, [buddy_free_heads]
+    xor eax, eax
+    mov ecx, BUDDY_ARENA_ORDER_MAX + 1
+    rep stosq
+
+    lea rax, [buddy_static_pool]
+    add rax, 0x3FFF
+    and rax, -0x4000
+
+    mov r13, rax
+
+    mov r12, 2
+
+    mov [buddy_arena_order], r12
+    mov byte [buddy_arena_from_pmm], 0
+
+    mov rcx, r12
+    mov rdx, r13
+    call buddy_push
+
+    mov [buddy_arena_base], r13
+    mov byte [buddy_arena_active], 1
+
+.ok:
+    xor eax, eax
+    pop rax
+    pop rcx
+    pop rdi
+    pop r13
+    pop r12
+    pop rbx
+    ret
+    
+buddy_alloc:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, rcx
+
+    mov r13, [buddy_arena_order]
+    test r13, r13
+    jz .fail
+
+    cmp r12, r13
+    ja .fail
+
+    mov r14, r12
+
+.find:
+    cmp r14, r13
+    ja .fail
+
+    mov rcx, r14
+    call buddy_pop
+
+    test rax, rax
+    jnz .got
+
+    inc r14
+    jmp .find
+
+.got:
+    mov r15, rax
+    mov rbx, r14
+
+.split:
+    cmp rbx, r12
+    je .done
+
+    dec rbx
+
+    mov rdx, 1
+    mov ecx, ebx
+    add ecx, PAGE_SHIFT
+    shl rdx, cl
+
+    lea rdx, [r15 + rdx]
+
+    mov rcx, rbx
+    call buddy_push
+
+    jmp .split
+
+.done:
+    mov qword [r15], 0
+    mov rax, r15
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.fail:
+    xor eax, eax
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+buddy_free:
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r14, rcx
+    mov r15, rdx
+
+    mov r13, [buddy_arena_order]
+    test r13, r13
+    jz .done
+
+    cmp r15, r13
+    ja .done
+
+.merge_loop:
+    cmp r15, r13
+    jae .add
+
+    mov rax, 1
+    mov ecx, r15d
+    add ecx, PAGE_SHIFT
+    shl rax, cl
+
+    mov r12, r14
+    xor r12, rax
+
+    mov rcx, r15
+    mov rdx, r12
+    call buddy_contains
+
+    test eax, eax
+    jz .add
+
+    mov rcx, r15
+    mov rdx, r12
+    call buddy_remove
+
+    cmp r14, r12
+    jb .keep_addr
+
+    mov r14, r12
+
+.keep_addr:
+    inc r15
+    jmp .merge_loop
+
+.add:
+    mov rcx, r15
+    mov rdx, r14
+    call buddy_push
+
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+buddy_arena_test:
+    push r12
+    push r13
+
+    lea r9, [msg_buddyarena_v3]
+    call draw_text
+
+    call buddy_reset
+
+    cld
+    lea rdi, [buddy_free_heads]
+    xor eax, eax
+    mov ecx, BUDDY_ARENA_ORDER_MAX + 1
+    rep stosq
+
+    mov r12, BUDDY_ARENA_ORDER_MAX
+
+.try_pmm:
+    cmp r12, BUDDY_ARENA_ORDER_MIN
+    jb .static_fallback
+
+    mov rcx, r12
+    call pmm_alloc_order
+    test rax, rax
+    jnz .got_pmm
+
+    dec r12
+    jmp .try_pmm
+
+.got_pmm:
+    mov r13, rax
+
+    mov [buddy_arena_order], r12
+    mov byte [buddy_arena_from_pmm], 1
+
+    mov rcx, r12
+    mov rdx, r13
+    call buddy_push
+
+    mov [buddy_arena_base], r13
+    mov byte [buddy_arena_active], 1
+
+    lea r9, [msg_buddy_pmm]
+    call draw_text
+
+    mov rcx, r12
+    call print_hex64
+
+    mov r9b, CHAR_LF
+    call console_putc
+
+    jmp .run_tests
+
+.static_fallback:
+    lea rax, [buddy_static_pool]
+
+    mov rdx, BUDDY_STATIC_BLOCK_SIZE - 1
+    add rax, rdx
+    not rdx
+    and rax, rdx
+
+    mov r13, rax
+
+    mov qword [buddy_arena_order], BUDDY_STATIC_ORDER
+    mov byte [buddy_arena_from_pmm], 0
+
+    mov rcx, BUDDY_STATIC_ORDER
+    mov rdx, r13
+    call buddy_push
+
+    mov [buddy_arena_base], r13
+    mov byte [buddy_arena_active], 1
+
+    lea r9, [msg_buddy_static]
+    call draw_text
+
+.run_tests:
+    mov rcx, 1
+    call buddy_alloc
+    test rax, rax
+    jz .fail_alloc1
+    mov r12, rax
+
+    mov rcx, 1
+    call buddy_alloc
+    test rax, rax
+    jz .fail_alloc2
+    mov r13, rax
+
+    cmp r12, r13
+    je .fail_alloc2
+
+    mov qword [r12], 0x1111
+    mov qword [r13], 0x2222
+
+    cmp qword [r12], 0x1111
+    jne .fail_write
+
+    cmp qword [r13], 0x2222
+    jne .fail_write
+
+    mov rcx, r12
+    mov rdx, 1
+    call buddy_free
+
+    mov rcx, r13
+    mov rdx, 1
+    call buddy_free
+
+    mov rcx, 2
+    call buddy_alloc
+    test rax, rax
+    jz .fail_merge_alloc
+
+    mov rcx, rax
+    mov rdx, 2
+    call buddy_free
+
+    pop r13
+    pop r12
+
+    lea r9, [msg_buddyarena_ok]
+    call draw_text
+    ret
+
+.fail_merge_alloc:
+    lea r9, [msg_buddyarena_fail_merge_alloc]
+    jmp .print_fail
+
+.fail_write:
+    mov rcx, r13
+    mov rdx, 1
+    call buddy_free
+
+    mov rcx, r12
+    mov rdx, 1
+    call buddy_free
+
+    lea r9, [msg_buddyarena_fail_write]
+    jmp .print_fail
+
+.fail_alloc2:
+    mov rcx, r12
+    mov rdx, 1
+    call buddy_free
+
+    lea r9, [msg_buddyarena_fail_alloc2]
+    jmp .print_fail
+
+.fail_alloc1:
+    lea r9, [msg_buddyarena_fail_alloc1]
+    jmp .print_fail
+
+.print_fail:
+    call draw_text
+
+    pop r13
+    pop r12
+    ret
+
+buddy_stress_test:
+    push r12
+    push r13
+    push r14
+    push r15
+
+    lea r9, [msg_buddystress_v1]
+    call draw_text
+
+    call buddy_reset
+
+    cld
+    lea rdi, [buddy_free_heads]
+    xor eax, eax
+    mov ecx, BUDDY_ARENA_ORDER_MAX + 1
+    rep stosq
+
+    mov r12, BUDDY_ARENA_ORDER_MAX
+
+.try_pmm:
+    cmp r12, BUDDY_ARENA_ORDER_MIN
+    jb .static_fallback
+
+    mov rcx, r12
+    call pmm_alloc_order
+    test rax, rax
+    jnz .got_pmm
+
+    dec r12
+    jmp .try_pmm
+
+.got_pmm:
+    mov r13, rax
+
+    mov [buddy_arena_order], r12
+    mov byte [buddy_arena_from_pmm], 1
+
+    mov rcx, r12
+    mov rdx, r13
+    call buddy_push
+
+    mov [buddy_arena_base], r13
+    mov byte [buddy_arena_active], 1
+
+    jmp .stress
+
+.static_fallback:
+    lea rax, [buddy_static_pool]
+
+    mov rdx, BUDDY_STATIC_BLOCK_SIZE - 1
+    add rax, rdx
+    not rdx
+    and rax, rdx
+
+    mov r13, rax
+
+    mov qword [buddy_arena_order], BUDDY_STATIC_ORDER
+    mov byte [buddy_arena_from_pmm], 0
+
+    mov rcx, BUDDY_STATIC_ORDER
+    mov rdx, r13
+    call buddy_push
+
+    mov [buddy_arena_base], r13
+    mov byte [buddy_arena_active], 1
+
+.stress:
+    ; Alloc 4 x order-0
+    mov rcx, 0
+    call buddy_alloc
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov rcx, 0
+    call buddy_alloc
+    test rax, rax
+    jz .fail
+    mov r13, rax
+
+    mov rcx, 0
+    call buddy_alloc
+    test rax, rax
+    jz .fail
+    mov r14, rax
+
+    mov rcx, 0
+    call buddy_alloc
+    test rax, rax
+    jz .fail
+    mov r15, rax
+
+    cmp r12, r13
+    je .fail
+    cmp r12, r14
+    je .fail
+    cmp r12, r15
+    je .fail
+    cmp r13, r14
+    je .fail
+    cmp r13, r15
+    je .fail
+    cmp r14, r15
+    je .fail
+
+    mov qword [r12], 0xA0
+    mov qword [r13], 0xA1
+    mov qword [r14], 0xA2
+    mov qword [r15], 0xA3
+
+    cmp qword [r12], 0xA0
+    jne .fail
+    cmp qword [r13], 0xA1
+    jne .fail
+    cmp qword [r14], 0xA2
+    jne .fail
+    cmp qword [r15], 0xA3
+    jne .fail
+
+    mov rcx, r13
+    mov rdx, 0
+    call buddy_free
+
+    mov rcx, r12
+    mov rdx, 0
+    call buddy_free
+
+    mov rcx, r15
+    mov rdx, 0
+    call buddy_free
+
+    mov rcx, r14
+    mov rdx, 0
+    call buddy_free
+
+    ; Alloc 2 x order-1
+    mov rcx, 1
+    call buddy_alloc
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov rcx, 1
+    call buddy_alloc
+    test rax, rax
+    jz .fail
+    mov r13, rax
+
+    cmp r12, r13
+    je .fail
+
+    mov qword [r12], 0xB0
+    mov qword [r13], 0xB1
+
+    cmp qword [r12], 0xB0
+    jne .fail
+    cmp qword [r13], 0xB1
+    jne .fail
+
+    mov rcx, r13
+    mov rdx, 1
+    call buddy_free
+
+    mov rcx, r12
+    mov rdx, 1
+    call buddy_free
+
+    ; Alloc 1 x order-2
+    mov rcx, 2
+    call buddy_alloc
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov qword [r12], 0xC0
+    cmp qword [r12], 0xC0
+    jne .fail
+
+    mov rcx, r12
+    mov rdx, 2
+    call buddy_free
+
+    ; Higher-order tests, if arena is large enough
+    mov rax, [buddy_arena_order]
+    cmp rax, 4
+    jb .ok
+
+    ; Alloc 1 x order-4
+    mov rcx, 4
+    call buddy_alloc
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov qword [r12], 0xD4
+    cmp qword [r12], 0xD4
+    jne .fail
+
+    mov rcx, r12
+    mov rdx, 4
+    call buddy_free
+
+    ; Alloc 2 x order-3
+    mov rcx, 3
+    call buddy_alloc
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov rcx, 3
+    call buddy_alloc
+    test rax, rax
+    jz .fail
+    mov r13, rax
+
+    cmp r12, r13
+    je .fail
+
+    mov qword [r12], 0xD3
+    mov qword [r13], 0xE3
+
+    cmp qword [r12], 0xD3
+    jne .fail
+    cmp qword [r13], 0xE3
+    jne .fail
+
+    mov rcx, r13
+    mov rdx, 3
+    call buddy_free
+
+    mov rcx, r12
+    mov rdx, 3
+    call buddy_free
+
+.ok:
+    lea r9, [msg_buddystress_ok]
+    call draw_text
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+.fail:
+    lea r9, [msg_buddystress_fail]
+    call draw_text
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+;================ Buddy PMM =================
+
+buddy_pmm_push:
+    lea r8, [buddy_pmm_heads]
+    mov r9, [r8 + rcx*8]
+
+    mov [rdx], r9
+    mov [r8 + rcx*8], rdx
+
+    ret
+
+buddy_pmm_pop:
+    lea rdx, [buddy_pmm_heads]
+    mov rax, [rdx + rcx*8]
+
+    test rax, rax
+    jz .done
+
+    mov r9, [rax]
+    mov [rdx + rcx*8], r9
+
+.done:
+    ret
+
+buddy_pmm_contains:
+    push r9
+
+    lea r9, [buddy_pmm_heads]
+    mov rax, [r9 + rcx*8]
+
+.loop:
+    test rax, rax
+    jz .no
+
+    cmp rax, rdx
+    je .yes
+
+    mov rax, [rax]
+    jmp .loop
+
+.yes:
+    mov eax, 1
+    pop r9
+    ret
+
+.no:
+    xor eax, eax
+    pop r9
+    ret
+
+buddy_pmm_remove:
+    push r9
+    push r10
+
+    lea r9, [buddy_pmm_heads]
+    lea r10, [r9 + rcx*8]
+
+.loop:
+    mov rax, [r10]
+
+    test rax, rax
+    jz .no
+
+    cmp rax, rdx
+    je .found
+
+    mov r10, rax
+    jmp .loop
+
+.found:
+    mov rax, [rax]
+    mov [r10], rax
+
+    mov eax, 1
+    pop r10
+    pop r9
+    ret
+
+.no:
+    xor eax, eax
+    pop r10
+    pop r9
+    ret
+
+buddy_pmm_alloc:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, rcx
+
+    cmp r12, BUDDY_PMM_ORDER
+    ja .fail
+
+    mov r14, r12
+
+.find:
+    cmp r14, BUDDY_PMM_ORDER
+    ja .fail
+
+    mov rcx, r14
+    call buddy_pmm_pop
+    test rax, rax
+    jnz .got
+
+    inc r14
+    jmp .find
+
+.got:
+    mov r15, rax
+    mov rbx, r14
+
+.split:
+    cmp rbx, r12
+    je .done
+
+    dec rbx
+
+    mov rdx, 1
+    mov ecx, ebx
+    add ecx, PAGE_SHIFT
+    shl rdx, cl
+
+    lea rdx, [r15 + rdx]
+
+    mov rcx, rbx
+    call buddy_pmm_push
+
+    jmp .split
+
+.done:
+    mov rax, r15
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.fail:
+    xor eax, eax
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+buddy_pmm_free:
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r14, rcx
+    mov r15, rdx
+
+    cmp r15, BUDDY_PMM_ORDER
+    ja .done
+
+.merge_loop:
+    cmp r15, BUDDY_PMM_ORDER
+    jae .add
+
+    mov rax, 1
+    mov ecx, r15d
+    add ecx, PAGE_SHIFT
+    shl rax, cl
+
+    mov r12, r14
+    xor r12, rax
+
+    mov rcx, r15
+    mov rdx, r12
+    call buddy_pmm_contains
+
+    test eax, eax
+    jz .add
+
+    mov rcx, r15
+    mov rdx, r12
+    call buddy_pmm_remove
+
+    cmp r14, r12
+    jb .keep_addr
+
+    mov r14, r12
+
+.keep_addr:
+    inc r15
+    jmp .merge_loop
+
+.add:
+    mov rcx, r15
+    mov rdx, r14
+    call buddy_pmm_push
+
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+buddy_pmm_init:
+    push rdi
+    push rcx
+    push rax
+    push rdx
+
+    cmp byte [buddy_pmm_active], 1
+    je .ok
+
+    cld
+    lea rdi, [buddy_pmm_heads]
+    xor eax, eax
+    mov ecx, BUDDY_PMM_ORDER + 1
+    rep stosq
+
+    lea rax, [buddy_pmm_pool_raw]
+
+    mov rdx, BUDDY_PMM_BLOCK_SIZE - 1
+    add rax, rdx
+    not rdx
+    and rax, rdx
+
+    mov [buddy_pmm_pool_phys], rax
+
+    mov rcx, BUDDY_PMM_ORDER
+    mov rdx, rax
+    call buddy_pmm_push
+
+    mov byte [buddy_pmm_active], 1
+
+.ok:
+    xor eax, eax
+
+    pop rdx
+    pop rax
+    pop rcx
+    pop rdi
+    ret
+
+buddy_pmm_reset:
+    push rdi
+    push rcx
+    push rax
+    push rdx
+
+    cld
+    lea rdi, [buddy_pmm_heads]
+    xor eax, eax
+    mov ecx, BUDDY_PMM_ORDER + 1
+    rep stosq
+
+    mov rax, [buddy_pmm_pool_phys]
+    test rax, rax
+    jz .done
+
+    mov rcx, BUDDY_PMM_ORDER
+    mov rdx, rax
+    call buddy_pmm_push
+
+    mov byte [buddy_pmm_active], 1
+
+.done:
+    xor eax, eax
+
+    pop rdx
+    pop rax
+    pop rcx
+    pop rdi
+    ret
+
+buddy_pmm_test:
+    push r12
+    push r13
+    push r14
+    push r15
+
+    lea r9, [msg_bpmm_v1]
+    call draw_text
+
+    call buddy_pmm_init
+    test eax, eax
+    jnz .fail
+
+    call buddy_pmm_reset
+    test eax, eax
+    jnz .fail
+
+    ; 4 x order-0
+    mov rcx, 0
+    call buddy_pmm_alloc
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov rcx, 0
+    call buddy_pmm_alloc
+    test rax, rax
+    jz .fail
+    mov r13, rax
+
+    mov rcx, 0
+    call buddy_pmm_alloc
+    test rax, rax
+    jz .fail
+    mov r14, rax
+
+    mov rcx, 0
+    call buddy_pmm_alloc
+    test rax, rax
+    jz .fail
+    mov r15, rax
+
+    cmp r12, r13
+    je .fail
+    cmp r12, r14
+    je .fail
+    cmp r12, r15
+    je .fail
+    cmp r13, r14
+    je .fail
+    cmp r13, r15
+    je .fail
+    cmp r14, r15
+    je .fail
+
+    mov qword [r12], 0x10
+    mov qword [r13], 0x11
+    mov qword [r14], 0x12
+    mov qword [r15], 0x13
+
+    cmp qword [r12], 0x10
+    jne .fail
+    cmp qword [r13], 0x11
+    jne .fail
+    cmp qword [r14], 0x12
+    jne .fail
+    cmp qword [r15], 0x13
+    jne .fail
+
+    mov rcx, r13
+    mov rdx, 0
+    call buddy_pmm_free
+
+    mov rcx, r12
+    mov rdx, 0
+    call buddy_pmm_free
+
+    mov rcx, r15
+    mov rdx, 0
+    call buddy_pmm_free
+
+    mov rcx, r14
+    mov rdx, 0
+    call buddy_pmm_free
+
+    ; 2 x order-1
+    mov rcx, 1
+    call buddy_pmm_alloc
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov rcx, 1
+    call buddy_pmm_alloc
+    test rax, rax
+    jz .fail
+    mov r13, rax
+
+    cmp r12, r13
+    je .fail
+
+    mov qword [r12], 0x20
+    mov qword [r13], 0x21
+
+    cmp qword [r12], 0x20
+    jne .fail
+    cmp qword [r13], 0x21
+    jne .fail
+
+    mov rcx, r13
+    mov rdx, 1
+    call buddy_pmm_free
+
+    mov rcx, r12
+    mov rdx, 1
+    call buddy_pmm_free
+
+    ; 1 x order-2
+    mov rcx, 2
+    call buddy_pmm_alloc
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov qword [r12], 0x30
+    cmp qword [r12], 0x30
+    jne .fail
+
+    mov rcx, r12
+    mov rdx, 2
+    call buddy_pmm_free
+
+    ; 1 x order-4
+    mov rcx, 4
+    call buddy_pmm_alloc
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov qword [r12], 0x40
+    cmp qword [r12], 0x40
+    jne .fail
+
+    mov rcx, r12
+    mov rdx, 4
+    call buddy_pmm_free
+
+    ; 2 x order-3
+    mov rcx, 3
+    call buddy_pmm_alloc
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov rcx, 3
+    call buddy_pmm_alloc
+    test rax, rax
+    jz .fail
+    mov r13, rax
+
+    cmp r12, r13
+    je .fail
+
+    mov qword [r12], 0x50
+    mov qword [r13], 0x51
+
+    cmp qword [r12], 0x50
+    jne .fail
+    cmp qword [r13], 0x51
+    jne .fail
+
+    mov rcx, r13
+    mov rdx, 3
+    call buddy_pmm_free
+
+    mov rcx, r12
+    mov rdx, 3
+    call buddy_pmm_free
+
+    lea r9, [msg_bpmm_ok]
+    call draw_text
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+.fail:
+    lea r9, [msg_bpmm_fail]
+    call draw_text
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
 cmd_execute:
     cmp qword [cmd_len], 0
     je .done
@@ -3654,6 +5100,26 @@ cmd_execute:
     call cmd_is
     test eax, eax
     jnz .mmflags
+
+    lea rsi, [str_cmd_buddytest]
+    call cmd_is
+    test eax, eax
+    jnz .buddytest
+
+    lea rsi, [str_cmd_buddyarena]
+    call cmd_is
+    test eax, eax
+    jnz .buddyarena
+
+    lea rsi, [str_cmd_buddystress]
+    call cmd_is
+    test eax, eax
+    jnz .buddystress
+
+    lea rsi, [str_cmd_bpmm]
+    call cmd_is
+    test eax, eax
+    jnz .bpmm
 
     lea rsi, [str_cmd_exit]
     call cmd_is
@@ -3965,6 +5431,22 @@ cmd_execute:
     call mm_flags_test
     ret
 
+.buddytest:
+    call buddy_test
+    ret
+
+.buddyarena:
+    call buddy_arena_test
+    ret
+
+.buddystress:
+    call buddy_stress_test
+    ret
+
+.bpmm:
+    call buddy_pmm_test
+    ret
+
 .exit:
     jmp exit_boot_services_sequence
 
@@ -4257,20 +5739,25 @@ str_cmd_exit:
 
 msg_help:
     db "Commands:",10
-    db "  help     - show this help",10
-    db "  clear    - clear screen",10
-    db "  mem      - memory info",10
-    db "  vmm      - vmm status",10
-    db "  detect   - system info",10
-    db "  serial   - serial test",10
-    db "  pmmtest  - test PMM allocator",10
-    db "  vmmtest  - test VMM mapping",10
-    db "  highmap  - map physical memory to higher-half",10
-    db "  heap     - initialize/show kernel heap",10
-    db "  heaptest - test kernel heap",10
-    db "  kmemtest - test kmem API",10
-    db "  mmflags  - test MM allocation flags",10
-    db "  exit     - exit boot services",10
+    db "  help        - show this help",10
+    db "  clear       - clear screen",10
+    db "  mem         - memory info",10
+    db "  vmm         - vmm status",10
+    db "  detect      - system info",10
+    db "  serial      - serial test",10
+    db "  pmmtest     - test PMM allocator",10
+    db "  vmmtest     - test VMM mapping",10
+    db "  highmap     - map physical memory to higher-half",10
+    db "  heap        - initialize/show kernel heap",10
+    db "  heaptest    - test kernel heap",10
+    db "  kmemtest    - test kmem API",10
+    db "  mmflags     - test MM allocation flags",10
+    db "  buddytest   - test buddy foundation",10
+    db "  buddyarena  - test real buddy arena",10
+    db "  buddystress - stress buddy allocator",10
+    db "  bpmm        - test Buddy PMM",10
+    db "  kernel      - enter kernel",10
+    db "  exit        - exit boot services",10
     db 0
 
 msg_unknown_cmd:
@@ -4371,6 +5858,7 @@ msg_highmap_ok:
 
 msg_highmap_fail:
     db "High map: FAIL",10,0
+
 kheap_active:
     db 0
 
@@ -4412,7 +5900,130 @@ msg_kmemtest_ok:
 
 msg_kmemtest_fail:
     db "Kmem test: FAIL",10,0
-    
+
+str_cmd_mmflags:
+    db "mmflags",0
+
+msg_mmflags_ok:
+    db "MM flags: OK",10,0
+
+msg_mmflags_fail:
+    db "MM flags: FAIL",10,0
+
+align 8
+pmm_order_counts:
+    times (PMM_ORDER_MAX + 1) dq 0
+
+pmm_order_cache:
+    times ((PMM_ORDER_MAX + 1) * PMM_ORDER_CACHE_MAX) dq 0
+
+str_cmd_buddytest:
+    db "buddytest",0
+
+msg_buddytest_ok:
+    db "Buddy test: OK",10,0
+
+msg_buddytest_fail:
+    db "Buddy test: FAIL",10,0
+
+buddy_arena_active:
+    db 0
+
+buddy_arena_base:
+    dq 0
+
+buddy_arena_order:
+    dq 0
+
+buddy_arena_from_pmm:
+    db 0
+
+align 8
+buddy_fallback_alloc:
+    dq 0
+
+align 8
+buddy_fallback_base:
+    dq 0
+
+align 8
+buddy_free_heads:
+    times (BUDDY_ARENA_ORDER_MAX + 1) dq 0
+
+str_cmd_buddyarena:
+    db "buddyarena",0
+
+msg_buddyarena_ok:
+    db "Buddy arena: OK",10,0
+
+msg_buddyarena_fail:
+    db "Buddy arena: FAIL",10,0
+
+msg_buddyarena_fail_init:
+    db "Buddy arena fail: init",10,0
+
+msg_buddyarena_fail_alloc1:
+    db "Buddy arena fail: alloc1",10,0
+
+msg_buddyarena_fail_alloc2:
+    db "Buddy arena fail: alloc2",10,0
+
+msg_buddyarena_fail_write:
+    db "Buddy arena fail: write/read",10,0
+
+msg_buddyarena_fail_merge_alloc:
+    db "Buddy arena fail: merge alloc order2",10,0
+
+msg_buddyarena_v2:
+    db "Buddy arena test v2",10,0
+
+msg_buddyarena_v3:
+    db "Buddy arena test v3",10,0
+
+msg_buddy_pmm:
+    db "Buddy arena: PMM order 0x",0
+
+msg_buddy_static:
+    db "Buddy arena: static",10,0
+
+str_cmd_buddystress:
+    db "buddystress",0
+
+msg_buddystress_v1:
+    db "Buddy stress test",10,0
+
+msg_buddystress_ok:
+    db "Buddy stress: OK",10,0
+
+msg_buddystress_fail:
+    db "Buddy stress: FAIL",10,0
+
+str_cmd_bpmm:
+    db "bpmm",0
+
+msg_bpmm_v1:
+    db "Buddy PMM test",10,0
+
+msg_bpmm_ok:
+    db "Buddy PMM: OK",10,0
+
+msg_bpmm_fail:
+    db "Buddy PMM: FAIL",10,0
+
+buddy_pmm_active:
+    db 0
+
+buddy_pmm_pool_phys:
+    dq 0
+
+align 8
+buddy_pmm_heads:
+    times (BUDDY_PMM_ORDER + 1) dq 0
+
+align 16
+buddy_pmm_pool_raw:
+    times (2 * BUDDY_PMM_BLOCK_SIZE) db 0
+
 font_table:
     db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
     db 0x18,0x18,0x18,0x18,0x18,0x00,0x18,0x00
@@ -4552,3 +6163,7 @@ old_idtr_base:
 align 4096
 pmm_bitmap:
     times PMM_BITMAP_SIZE db 0
+
+align 16
+buddy_static_pool:
+    times (2 * BUDDY_STATIC_BLOCK_SIZE) db 0
