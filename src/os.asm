@@ -7492,20 +7492,175 @@ exit_boot_services_sequence:
 
     call exit_boot_services
 
-    lea r9, [msg_exitbs_ok]
-    call draw_text
+    call kernel_entry
 
 .halt:
     cli
     hlt
     jmp .halt
 
+kernel_entry:
+    cli
+
+    call gdt_init
+    call tss_init
+    call idt_init_full
+
+    lea rsp, [kernel_stack_top]
+
+    call vmm_activate
+    mov byte [vmm_active], 1
+
+    call console_clear
+
+    lea r9, [msg_kernel_banner]
+    call draw_text
+
+    lea r9, [prompt_str]
+    call draw_text
+
+    call cursor_draw
+    mov dword [blink_counter], 0
+
+.kernel_loop:
+    call ps2_keyboard_read
+    test al, al
+    jz .no_key
+
+    call process_key
+    call cursor_draw
+
+    mov dword [blink_counter], 0
+    jmp .kernel_loop
+
+.no_key:
+    call stall_1ms_kernel
+
+    inc dword [blink_counter]
+    cmp dword [blink_counter], CURSOR_BLINK_MS
+    jb .kernel_loop
+
+    mov dword [blink_counter], 0
+    call cursor_toggle
+    jmp .kernel_loop
+
 exit_boot_services:
-    jmp boot_exit
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
 
-fail:
-    mov al, '0'
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .err_bs
 
+    mov r13, [rbx + BS_EXIT_BOOT_SERVICES]
+    test r13, r13
+    jz .err_ptr
+
+    xor r14, r14
+
+.retry:
+    call boot_get_memory_map
+
+    mov rcx, [image_handle]
+    mov rdx, [boot_info + BootInfo.mem_map_key]
+    call r13
+
+    test rax, rax
+    jz .success
+
+    inc r14
+    cmp r14, 3
+    jb .retry
+
+    FAIL_CODE 'X'
+
+.err_bs:
+    FAIL_CODE 'Y'
+
+.err_ptr:
+    FAIL_CODE 'Z'
+
+.success:
+    cli
+
+    mov rsp, r12
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+    
+stall_1ms_kernel:
+    push rcx
+    mov rcx, 0x10000
+.delay:
+    nop
+    loop .delay
+    pop rcx
+    ret
+ 
+ps2_keyboard_read:
+    in al, 0x64
+    test al, 1
+    jz .nokey
+
+    in al, 0x60
+
+    cmp al, 0xE0
+    je .nokey
+
+    test al, 0x80
+    jnz .nokey
+
+    cmp al, 0x0E
+    je .backspace
+
+    cmp al, 0x1C
+    je .enter
+
+    cmp al, 0x39
+    je .space
+
+    cmp al, 0x0F
+    je .tab
+
+    cmp al, 0x02
+    jb .nokey
+
+    cmp al, 0x58
+    ja .nokey
+
+    movzx eax, byte [ps2_scancode_table + rax]
+    test al, al
+    jz .nokey
+
+    ret
+
+.backspace:
+    mov eax, KEY_BACKSPACE
+    ret
+
+.enter:
+    mov eax, KEY_ENTER
+    ret
+
+.space:
+    mov eax, KEY_SPACE
+    ret
+
+.tab:
+    mov eax, CHAR_TAB
+    ret
+
+.nokey:
+    xor eax, eax
+    ret
+       
 fail_code:
     cli
 
@@ -8136,6 +8291,19 @@ msg_testall_pass:
 
 msg_testall_fail:
     db "FAILED at test 0x",0
+
+ps2_scancode_table:
+    db 0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0x08, 0x09
+    db 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', 0x0A, 0, 'a', 's'
+    db 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', 0x27, '`', 0, 0x5C, 'z', 'x', 'c', 'v'
+    db 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' ', 0, 0, 0, 0, 0, 0
+    db 0, 0, 0, 0, 0, 0, 0, '7', '8', '9', '-', '4', '5', '6', '+', '1'
+    db '2', '3', '0', '.', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+
+msg_kernel_banner:
+    db "0xDEAD OS - Kernel Mode",10
+    db "UEFI services terminated.",10
+    db 0
 
 font_table:
     db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
