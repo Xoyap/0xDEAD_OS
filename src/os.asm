@@ -68,10 +68,19 @@ global _e
 %define MEM_TYPE_BS_DATA       4
 %define MEM_TYPE_CONVENTIONAL  7
 
-%define PMM_MAX_PAGES          0x200000
+%define PMM_MAX_PAGES          0x400000
 %define PMM_BITMAP_SIZE        (PMM_MAX_PAGES / 8)
 %define PMM_ORDER_MAX          11
 %define PMM_CACHE_MAX          256
+
+%define MM_REGION_MAX          64
+%define MM_REGION_FREE         0
+%define MM_REGION_RESERVED     1
+%define MM_REGION_KERNEL       2
+%define MM_REGION_FRAMEBUFFER  3
+%define MM_REGION_PAGETABLE    4
+%define MM_REGION_PMM          5
+%define MM_REGION_RUNTIME      6
 
 %define PAGE_PRESENT             (1 << 0)
 %define PAGE_WRITABLE            (1 << 1)
@@ -159,9 +168,18 @@ struc BootInfo
     .mem_desc_size:     resq 1
     .mem_desc_version:  resq 1
 
+    .mem_map_copy:      resq 1
+    .mem_map_copy_size: resq 1
+
     .pmm_bitmap:        resq 1
     .pmm_total_pages:   resq 1
     .pmm_free_pages:    resq 1
+endstruc
+
+struc MemRegion
+    .start: resq 1
+    .end:   resq 1
+    .type:  resq 1
 endstruc
 
 section .text
@@ -179,107 +197,10 @@ _e:
     lea rsi, [s_boot_serial]
     call serial_puts
 
-    mov rax, [r12 + ST_CONIN_OFFSET]
-    mov [conin], rax
-
-    mov rbx, [r12 + ST_BS]
-    test rbx, rbx
-    jz fail
-    mov [bs], rbx
-
-    mov rax, [rbx + BS_SET_WATCHDOG_TIMER]
-    test rax, rax
-    jz .watchdog_ok
-
-    xor ecx, ecx
-    xor edx, edx
-    xor r8d, r8d
-    xor r9d, r9d
-    call rax
-
-.watchdog_ok:
-    mov rbx, [bs]
-    mov rax, [rbx + BS_LOCATE_PROTOCOL]
-    test rax, rax
-    jz fail
-
-    lea rcx, [guid]
-    xor edx, edx
-    lea r8, [gop]
-
-    call rax
-    add rsp, 32
-
-    test rax, rax
+    mov rdx, r12
+    call boot_prepare
+    test eax, eax
     jnz fail
-
-    mov rbx, [gop]
-    test rbx, rbx
-    jz fail
-
-    mov rbx, [rbx + GOP_MODE]
-    test rbx, rbx
-    jz fail
-
-    mov rax, [rbx + M_FB]
-    test rax, rax
-    jz fail
-    mov [video + Video.fb], rax
-
-    mov rsi, [rbx + M_INF]
-    test rsi, rsi
-    jz fail
-
-    mov eax, [rsi + I_HRES]
-    test eax, eax
-    jnz .hres_ok
-    mov eax, 1
-.hres_ok:
-    mov [video + Video.w], rax
-
-    mov eax, [rsi + I_VRES]
-    test eax, eax
-    jnz .vres_ok
-    mov eax, 1
-.vres_ok:
-    mov [video + Video.h], rax
-
-    mov eax, [rsi + I_SL]
-    test eax, eax
-    jnz .stride_ok
-    mov eax, [video + Video.w]
-    test eax, eax
-    jnz .stride_ok
-    mov eax, 1
-.stride_ok:
-    mov [video + Video.sl], rax
-
-    mov rax, [video + Video.sl]
-    cmp qword [video + Video.w], rax
-    jbe .width_ok
-    mov [video + Video.w], rax
-.width_ok:
-
-    mov rax, [video + Video.w]
-    cmp rax, START_X + CHAR_W
-    jae .margin_ok
-    mov qword [margin_x], 0
-.margin_ok:
-
-    mov rax, [video + Video.fb]
-    mov [boot_info + BootInfo.fb], rax
-
-    mov rax, [video + Video.w]
-    mov [boot_info + BootInfo.width], rax
-
-    mov rax, [video + Video.h]
-    mov [boot_info + BootInfo.height], rax
-
-    mov rax, [video + Video.sl]
-    mov [boot_info + BootInfo.stride], rax
-
-    mov qword [video + Video.fg], 0x00FFFFFF
-    mov qword [video + Video.bg], 0x00000000
 
     call console_clear
 
@@ -331,9 +252,6 @@ _e:
     call keyboard_init
     call cursor_draw
 
-    call key_event_init
-    call timer_event_init
-
     cmp byte [vmm_supported], 1
     jne .vmm_no_activate
 
@@ -349,9 +267,15 @@ _e:
     lea rsi, [s_vmm_active]
     call serial_puts
 
+    call idt_init_minimal
+
+    jmp .after_idt
+
 .vmm_no_activate:
 
     call idt_init_minimal
+
+.after_idt:
 
     lea r9, [msg_idt_ok]
     call draw_text
@@ -367,14 +291,6 @@ _e:
 
     call cursor_draw
     mov dword [blink_counter], 0
-
-    cmp byte [events_ready], 1
-    jne .busy_loop
-
-    cmp byte [timer_ready], 1
-    je .event_loop
-
-    jmp .busy_loop
 
 .busy_loop:
     call keyboard_get
@@ -397,32 +313,6 @@ _e:
     mov dword [blink_counter], 0
     call cursor_toggle
     jmp .busy_loop
-
-.event_loop:
-    call wait_event
-
-    cmp eax, 0
-    je .event_key
-
-    cmp eax, 1
-    je .event_timer
-
-    jmp .busy_loop
-
-.event_key:
-    call keyboard_get
-    test al, al
-    jz .event_loop
-
-    call process_key
-    call cursor_draw
-
-    call timer_restart
-    jmp .event_loop
-
-.event_timer:
-    call cursor_toggle
-    jmp .event_loop
 
 process_key:
     sub rsp, 8
@@ -877,80 +767,10 @@ init_keyboard:
     ret
 
 keyboard_get:
-    call keyboard_poll
-    ret
+    jmp input_poll
 
 keyboard_poll:
-    push rbx
-    push r12
-
-    mov r12, rsp
-    and rsp, -16
-    sub rsp, 48
-
-    mov rcx, [conin]
-    test rcx, rcx
-    jz .nokey
-
-    mov rax, [rcx + 8]
-    test rax, rax
-    jz .nokey
-
-    lea rdx, [rsp + 32]
-    call rax
-
-    test rax, rax
-    jnz .nokey
-
-    movzx ecx, word [rsp + 32]
-    movzx eax, word [rsp + 34]
-
-    test eax, eax
-    jnz .have_unicode
-
-    cmp ecx, EFI_SCAN_DELETE
-    je .scan_backspace
-    jmp .nokey
-
-.scan_backspace:
-    mov eax, KEY_BACKSPACE
-    jmp .key_ok
-
-.have_unicode:
-    cmp eax, CHAR_CR
-    jne .not_cr
-    mov eax, KEY_ENTER
-.not_cr:
-
-    cmp eax, KEY_DELETE
-    jne .not_del
-    mov eax, KEY_BACKSPACE
-.not_del:
-
-    cmp eax, KEY_BACKSPACE
-    je .key_ok
-    cmp eax, KEY_ENTER
-    je .key_ok
-    cmp eax, CHAR_TAB
-    je .key_ok
-
-    cmp eax, KEY_SPACE
-    jb .nokey
-    cmp eax, KEY_DELETE
-    ja .nokey
-
-.key_ok:
-    mov rsp, r12
-    pop r12
-    pop rbx
-    ret
-
-.nokey:
-    xor eax, eax
-    mov rsp, r12
-    pop r12
-    pop rbx
-    ret
+    jmp input_poll
 
 key_event_init:
     mov byte [events_ready], 0
@@ -971,49 +791,20 @@ key_event_init:
     ret
 
 timer_event_init:
-    push rbx
-    push r12
-
-    mov r12, rsp
-    and rsp, -16
-    sub rsp, 48
+    sub rsp, 8
 
     mov byte [timer_ready], 0
 
-    mov rbx, [bs]
-    test rbx, rbx
-    jz .fail
-
-    mov rax, [rbx + BS_CREATE_EVENT]
-    test rax, rax
-    jz .fail
-
-    mov ecx, EVT_TIMER
-    xor edx, edx
-    xor r8d, r8d
-    xor r9d, r9d
-
-    lea r10, [timer_event]
-    mov [rsp + 32], r10
-
-    call rax
-    test rax, rax
+    lea rcx, [timer_event]
+    call boot_create_timer_event
+    test eax, eax
     jnz .fail
 
-    mov rbx, [bs]
-    mov rax, [rbx + BS_SET_TIMER]
-    test rax, rax
-    jz .fail
-
     mov rcx, [timer_event]
-    test rcx, rcx
-    jz .fail
-
     mov edx, TIMER_PERIODIC
     mov r8, CURSOR_BLINK_100NS
-
-    call rax
-    test rax, rax
+    call boot_set_timer
+    test eax, eax
     jnz .fail
 
     mov rax, [timer_event]
@@ -1021,20 +812,14 @@ timer_event_init:
     mov byte [timer_ready], 1
 
 .fail:
-    mov rsp, r12
-    pop r12
-    pop rbx
+    add rsp, 8
     ret
-
+    
 wait_event:
     push r12
     mov r12, rsp
     and rsp, -16
     sub rsp, 32
-
-    mov rax, [bs]
-    test rax, rax
-    jz .error
 
     cmp byte [events_ready], 1
     jne .error
@@ -1046,8 +831,8 @@ wait_event:
     jne .one_event
 
     mov rcx, 2
-    call qword [rax + BS_WAIT_FOR_EVENT]
-    test rax, rax
+    call boot_wait_events
+    test eax, eax
     jnz .error
 
     mov rax, [event_index]
@@ -1062,8 +847,8 @@ wait_event:
 
 .one_event:
     mov rcx, 1
-    call qword [rax + BS_WAIT_FOR_EVENT]
-    test rax, rax
+    call boot_wait_events
+    test eax, eax
     jnz .error
 
 .key:
@@ -1083,66 +868,28 @@ wait_event:
     ret
 
 timer_restart:
+    sub rsp, 8
+
     cmp byte [timer_ready], 1
     jne .done
-
-    push r12
-    mov r12, rsp
-    and rsp, -16
-    sub rsp, 32
-
-    mov rax, [bs]
-    test rax, rax
-    jz .pop
-
-    mov rax, [rax + BS_SET_TIMER]
-    test rax, rax
-    jz .pop
 
     mov rcx, [timer_event]
     xor edx, edx
     xor r8d, r8d
-    call rax
-
-    mov rax, [bs]
-    mov rax, [rax + BS_SET_TIMER]
-    test rax, rax
-    jz .pop
+    call boot_set_timer
 
     mov rcx, [timer_event]
     mov edx, TIMER_PERIODIC
     mov r8, CURSOR_BLINK_100NS
-    call rax
-
-.pop:
-    mov rsp, r12
-    pop r12
+    call boot_set_timer
 
 .done:
+    add rsp, 8
     ret
 
 stall_1ms:
-    push r12
-    mov r12, rsp
-    and rsp, -16
-    sub rsp, 32
-
     mov rcx, 1000
-
-    mov rax, [bs]
-    test rax, rax
-    jz .done
-
-    mov rax, [rax + BS_STALL]
-    test rax, rax
-    jz .done
-
-    call rax
-
-.done:
-    mov rsp, r12
-    pop r12
-    ret
+    jmp boot_stall
 
 draw_char:
     push rbx
@@ -1387,170 +1134,19 @@ mem_init:
     cmp qword [boot_info + BootInfo.mem_map], 0
     jne .have_map
 
-    call get_memory_map
+    call boot_get_memory_map
 
 .have_map:
     call pmm_init
+
+    call copy_memory_map
+
+    call pmm_reserve_boot
+
     ret
 
 get_memory_map:
-    push rbx
-    push r12
-    push r13
-    push r14
-
-    mov r12, rsp
-    and rsp, -16
-    sub rsp, 48
-
-    mov rbx, [bs]
-    test rbx, rbx
-    jz .err_bs
-
-    mov r13, [rbx + BS_GET_MEMORY_MAP]
-    test r13, r13
-    jz .err_gmm_ptr
-
-    xor r14, r14
-
-.retry:
-    mov qword [mm_tmp_size], 0
-    mov qword [mm_tmp_buffer], 0
-
-    lea rcx, [mm_tmp_size]
-    xor edx, edx
-    lea r8, [mm_tmp_key]
-    lea r9, [mm_tmp_desc_size]
-    lea r10, [mm_tmp_desc_version]
-    mov [rsp + 32], r10
-    call r13
-
-    cmp rax, 5
-    je .allocate
-
-    mov r10, EFI_BUFFER_TOO_SMALL
-    cmp rax, r10
-    je .allocate
-
-    test rax, rax
-    jnz .err_first
-
-    cmp qword [mm_tmp_size], 0
-    je .err_size
-
-.allocate:
-    mov rdx, [mm_tmp_desc_size]
-    test rdx, rdx
-    jnz .desc_ok
-    mov rdx, 48
-
-.desc_ok:
-    shl rdx, 4
-    add rdx, 4096
-    add rdx, [mm_tmp_size]
-    mov [mm_tmp_size], rdx
-
-    mov ecx, EFI_LOADER_DATA
-    mov rdx, [mm_tmp_size]
-    lea r8, [mm_tmp_buffer]
-
-    mov rax, [rbx + BS_ALLOCATE_POOL]
-    test rax, rax
-    jz .err_alloc
-    call rax
-
-    test rax, rax
-    jnz .err_alloc
-
-    mov rdx, [mm_tmp_buffer]
-    test rdx, rdx
-    jz .err_buf
-
-    mov r13, [rbx + BS_GET_MEMORY_MAP]
-    test r13, r13
-    jz .err_gmm_ptr2
-
-    lea rcx, [mm_tmp_size]
-    mov rdx, [mm_tmp_buffer]
-    lea r8, [mm_tmp_key]
-    lea r9, [mm_tmp_desc_size]
-    lea r10, [mm_tmp_desc_version]
-    mov [rsp + 32], r10
-    call r13
-
-    test rax, rax
-    jz .success
-
-    cmp rax, 5
-    je .retry_path
-
-    mov r10, EFI_BUFFER_TOO_SMALL
-    cmp rax, r10
-    jne .err_second
-
-.retry_path:
-    mov rcx, [mm_tmp_buffer]
-    test rcx, rcx
-    jz .retry_no_free
-
-    mov rax, [rbx + BS_FREE_POOL]
-    test rax, rax
-    jz .retry_no_free
-    call rax
-
-.retry_no_free:
-    inc r14
-    cmp r14, 3
-    jb .retry
-
-    FAIL_CODE '9'
-
-.success:
-    mov rax, [mm_tmp_buffer]
-    mov [boot_info + BootInfo.mem_map], rax
-
-    mov rax, [mm_tmp_size]
-    mov [boot_info + BootInfo.mem_size], rax
-
-    mov rax, [mm_tmp_key]
-    mov [boot_info + BootInfo.mem_map_key], rax
-
-    mov rax, [mm_tmp_desc_size]
-    mov [boot_info + BootInfo.mem_desc_size], rax
-
-    mov eax, [mm_tmp_desc_version]
-    mov [boot_info + BootInfo.mem_desc_version], rax
-
-    mov rsp, r12
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    ret
-
-.err_bs:
-    FAIL_CODE '1'
-
-.err_gmm_ptr:
-    FAIL_CODE '2'
-
-.err_first:
-    FAIL_CODE '3'
-
-.err_size:
-    FAIL_CODE '4'
-
-.err_alloc:
-    FAIL_CODE '5'
-
-.err_buf:
-    FAIL_CODE '6'
-
-.err_gmm_ptr2:
-    FAIL_CODE '7'
-
-.err_second:
-    FAIL_CODE '8'
+    jmp boot_get_memory_map
 
 pmm_init:
     push rbx
@@ -2270,6 +1866,446 @@ pmm_free_order:
     mov rcx, r12
     call pmm_free_page
     jmp .done
+
+;================ MM_REGION =================
+
+mm_region_add:
+    push r12
+    push r13
+
+    mov r12, [mm_region_count]
+    cmp r12, MM_REGION_MAX
+    jae .done
+
+    mov r13, MM_REGION_MAX
+    cmp r12, r13
+    jae .done
+
+    imul r12, 24
+
+    mov [mm_regions + r12 + MemRegion.start], rcx
+    mov [mm_regions + r12 + MemRegion.end], rdx
+    mov qword [mm_regions + r12 + MemRegion.type], r8
+
+    inc qword [mm_region_count]
+
+.done:
+    pop r13
+    pop r12
+    ret
+
+mm_region_reserve_range:
+    push rbx
+    push r10
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, rcx
+    mov r13, rdx
+
+    shr r12, PAGE_SHIFT
+    shr r13, PAGE_SHIFT
+
+    add r13, 1
+
+    mov r10, [boot_info + BootInfo.pmm_bitmap]
+    test r10, r10
+    jz .skip_count
+
+    mov r14, r12
+    xor r15d, r15d
+
+.count_loop:
+    cmp r14, r13
+    jae .do_set
+
+    mov rcx, r14
+    shr rcx, 6
+    mov rdx, r14
+    and edx, 63
+    bt qword [r10 + rcx*8], rdx
+    jc .page_used
+    inc r15d
+
+.page_used:
+    inc r14
+    jmp .count_loop
+
+.skip_count:
+    xor r15d, r15d
+
+.do_set:
+    mov rcx, r12
+    mov rdx, r13
+    call pmm_set_range
+
+    mov eax, r15d
+    sub qword [boot_info + BootInfo.pmm_free_pages], rax
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop rbx
+    ret
+
+;================ COPY_MEMORY_MAP =================
+
+copy_memory_map:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    mov r12, [boot_info + BootInfo.mem_size]
+    test r12, r12
+    jz .done
+
+    mov rcx, r12
+    add rcx, 4095
+    and rcx, -4096
+    call pmm_alloc_page_order
+
+    test rax, rax
+    jz .done
+
+    mov r13, rax
+
+    mov r14, [boot_info + BootInfo.mem_map]
+    mov r15, r12
+
+    cld
+    mov rdi, r13
+    mov rsi, r14
+    mov rcx, r15
+    add rcx, 7
+    shr rcx, 3
+    rep movsq
+
+    mov [boot_info + BootInfo.mem_map_copy], r13
+    mov [boot_info + BootInfo.mem_map_copy_size], r15
+
+.done:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+pmm_alloc_page_order:
+    push r12
+    push r13
+
+    mov r12, rcx
+    add r12, PAGE_SIZE - 1
+    shr r12, PAGE_SHIFT
+
+    mov r13, 0
+.find_order:
+    mov rax, 1
+    mov ecx, r13d
+    shl rax, cl
+    cmp rax, r12
+    jae .found
+    inc r13
+    cmp r13, PMM_ORDER_MAX
+    jbe .find_order
+    jmp .fail
+
+.found:
+    mov rcx, r13
+    call pmm_alloc_order
+    test rax, rax
+    jz .fail
+
+    pop r13
+    pop r12
+    ret
+
+.fail:
+    xor eax, eax
+    pop r13
+    pop r12
+    ret
+
+;================ PMM_RESERVE_BOOT =================
+
+pmm_reserve_boot:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    mov r14, [boot_info + BootInfo.mem_map_copy]
+    test r14, r14
+    jnz .have_copy
+
+    mov r14, [boot_info + BootInfo.mem_map]
+    test r14, r14
+    jz .done
+
+.have_copy:
+    mov r15, [boot_info + BootInfo.mem_size]
+    mov rbx, [boot_info + BootInfo.mem_desc_size]
+
+    test r15, r15
+    jz .done
+    test rbx, rbx
+    jz .done
+
+.loop:
+    cmp r15, rbx
+    jb .finish
+
+    mov eax, [r14]
+
+    cmp eax, MEM_TYPE_BS_CODE
+    je .reserve
+
+    cmp eax, MEM_TYPE_BS_DATA
+    je .reserve
+
+    cmp eax, MEM_TYPE_LOADER_CODE
+    je .reserve
+
+    cmp eax, MEM_TYPE_LOADER_DATA
+    je .reserve
+
+    cmp eax, 5
+    je .reserve
+
+    cmp eax, 6
+    je .reserve
+
+    cmp eax, 9
+    je .reserve
+
+    cmp eax, 10
+    je .reserve
+
+    cmp eax, 11
+    je .reserve
+
+    jmp .next
+
+.reserve:
+    mov r12, [r14 + 8]
+    mov r13, [r14 + 24]
+    shl r13, PAGE_SHIFT
+    add r13, r12
+
+    mov rcx, r12
+    mov rdx, r13
+    mov r8, MM_REGION_RESERVED
+    call mm_region_add
+
+    mov rcx, r12
+    mov rdx, r13
+    call mm_region_reserve_range
+
+.next:
+    add r14, rbx
+    sub r15, rbx
+    jmp .loop
+
+.finish:
+    mov rcx, [video + Video.fb]
+    mov rax, [video + Video.sl]
+    mov rdx, [video + Video.h]
+    imul rax, rdx
+    shl rax, 2
+    add rax, rcx
+    mov rdx, rax
+    mov r8, MM_REGION_FRAMEBUFFER
+    call mm_region_add
+
+    mov rcx, [video + Video.fb]
+    mov rdx, rax
+    call mm_region_reserve_range
+
+    lea rcx, [pmm_bitmap]
+    lea rdx, [pmm_bitmap + PMM_BITMAP_SIZE]
+    mov r8, MM_REGION_PMM
+    call mm_region_add
+
+    lea rcx, [pmm_bitmap]
+    lea rdx, [pmm_bitmap + PMM_BITMAP_SIZE]
+    call mm_region_reserve_range
+
+    mov rax, [boot_info + BootInfo.mem_map_copy]
+    test rax, rax
+    jz .done
+
+    mov rcx, rax
+    mov rdx, [boot_info + BootInfo.mem_map_copy_size]
+    add rdx, rcx
+    mov r8, MM_REGION_PMM
+    call mm_region_add
+
+    mov rcx, rax
+    mov rdx, [boot_info + BootInfo.mem_map_copy_size]
+    add rdx, rcx
+    call mm_region_reserve_range
+
+.done:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+;================ MM_API =================
+
+mm_alloc_pages:
+    push r12
+    push r13
+    push r14
+
+    mov r12, rcx
+    mov r13, rdx
+
+    test r12, r12
+    jz .fail
+
+    add r12, PAGE_SIZE - 1
+    shr r12, PAGE_SHIFT
+
+    mov r14, 0
+.find_order:
+    mov rax, 1
+    mov ecx, r14d
+    shl rax, cl
+    cmp rax, r12
+    jae .found
+    inc r14
+    cmp r14, PMM_ORDER_MAX
+    jbe .find_order
+    jmp .fail
+
+.found:
+    mov rcx, r14
+    mov rdx, r13
+    call mm_alloc_order_flags
+    test rax, rax
+    jz .fail
+
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+.fail:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+mm_free_pages:
+    push r12
+    push r13
+    push r14
+
+    mov r14, rcx
+    mov r12, rdx
+
+    test r14, r14
+    jz .done
+
+    add r12, PAGE_SIZE - 1
+    shr r12, PAGE_SHIFT
+
+    xor ecx, ecx
+.find_order:
+    mov rax, 1
+    shl rax, cl
+    cmp rax, r12
+    jae .found
+    inc rcx
+    cmp rcx, PMM_ORDER_MAX
+    jbe .find_order
+    jmp .done
+
+.found:
+    mov rdx, rcx
+    mov rcx, r14
+    call pmm_free_order_flags
+
+.done:
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+mm_kmem_alloc:
+    push r12
+    push r13
+
+    mov r12, rcx
+    mov r13, rdx
+
+    test r12, r12
+    jz .fail
+
+    call kheap_init
+    test eax, eax
+    jnz .fail
+
+    mov rcx, r12
+    call kmalloc
+    test rax, rax
+    jz .fail
+
+    test r13, MM_FLAG_ZERO
+    jz .done
+
+    push rax
+    push r12
+
+    mov r12, rax
+    mov rdx, [r12 - KHEAP_HEADER_SIZE]
+    sub rdx, KHEAP_HEADER_SIZE
+    mov rcx, r12
+    xor r8d, r8d
+    call kmemset
+
+    pop r12
+    pop rax
+
+.done:
+    pop r13
+    pop r12
+    ret
+
+.fail:
+    xor eax, eax
+    pop r13
+    pop r12
+    ret
+
+mm_kmem_free:
+    jmp kfree
+
+mm_phys_to_virt:
+    mov rax, [phys_map_base_val]
+    add rax, rcx
+    ret
+
+mm_virt_to_phys:
+    mov rax, rcx
+    sub rax, [phys_map_base_val]
+    ret
 
 mem_alloc:
     test rcx, rcx
@@ -3169,6 +3205,153 @@ idt_init_minimal:
     pop rbx
     ret
 
+gdt_init:
+    cli
+    lgdt [gdt_ptr]
+
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    xor eax, eax
+    mov fs, ax
+    mov gs, ax
+
+    push qword 0x08
+    lea rax, [.cs_set]
+    push rax
+    retfq
+
+.cs_set:
+    ret
+
+tss_init:
+    push rbx
+    push r12
+
+    lea r12, [tss]
+
+    lea rax, [kernel_stack_top]
+    mov [r12 + 4], rax
+
+    lea rax, [ist_stack_top]
+    mov [r12 + 20], rax
+
+    lea rbx, [gdt]
+    add rbx, 0x28
+
+    lea rax, [tss]
+    mov ecx, eax
+    shr eax, 24
+    shl eax, 8
+    or ecx, eax
+    mov [rbx], ecx
+
+    mov eax, tss_end - tss - 1
+    mov ecx, eax
+    shl ecx, 16
+    mov eax, 0x89
+    shl eax, 40
+    or ecx, eax
+    mov [rbx + 4], ecx
+
+    lea rax, [tss]
+    shr rax, 32
+    mov [rbx + 8], eax
+
+    mov ax, 0x28
+    ltr ax
+
+    pop r12
+    pop rbx
+    ret
+
+idt_init_full:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rdi
+    sub rsp, 8
+
+    cld
+
+    lea rdi, [idt]
+    xor eax, eax
+    mov rcx, 256 * 16 / 8
+    rep stosq
+
+    lea r12, [isr_stub_table]
+    xor r13, r13
+
+.fill_specific:
+    cmp r13, 32
+    jae .fill_default
+
+    movsxd rax, dword [r12 + r13 * 4]
+    lea rax, [r12 + rax]
+
+    lea r14, [idt]
+    mov rcx, r13
+    imul rcx, 16
+    add r14, rcx
+
+    mov ecx, eax
+    mov word [r14 + 0], cx
+    mov word [r14 + 2], 0x08
+    mov byte [r14 + 4], 1
+    mov byte [r14 + 5], 0x8E
+    shr eax, 16
+    mov word [r14 + 6], ax
+    shr eax, 16
+    mov dword [r14 + 8], eax
+    mov dword [r14 + 12], 0
+
+    inc r13
+    jmp .fill_specific
+
+.fill_default:
+    cmp r13, 256
+    jae .load_idt
+
+    lea rax, [isr_default]
+
+    lea r14, [idt]
+    mov rcx, r13
+    imul rcx, 16
+    add r14, rcx
+
+    mov ecx, eax
+    mov word [r14 + 0], cx
+    mov word [r14 + 2], 0x08
+    mov byte [r14 + 4], 1
+    mov byte [r14 + 5], 0x8E
+    shr eax, 16
+    mov word [r14 + 6], ax
+    shr eax, 16
+    mov dword [r14 + 8], eax
+    mov dword [r14 + 12], 0
+
+    inc r13
+    jmp .fill_default
+
+.load_idt:
+    lea rax, [idt]
+    mov [new_idtr_base], rax
+    lidt [new_idtr_limit]
+
+    add rsp, 8
+    pop rdi
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+isr_default:
+    push qword 0
+    push qword 0xFF
+    jmp isr_common
 ;================ KHEAP_INIT =================
 
 kheap_init:
@@ -3490,8 +3673,8 @@ mm_alloc_order:
 pmm_free_order_flags:
     push rax
     push r10
+    push rdx
 
-    ; If address belongs to Buddy PMM pool, free it there
     mov rax, [buddy_pmm_pool_phys]
     test rax, rax
     jz .normal_pmm
@@ -3507,11 +3690,13 @@ pmm_free_order_flags:
 
     call buddy_pmm_free
 
+    pop rdx
     pop r10
     pop rax
     ret
 
 .normal_pmm:
+    pop rdx
     call pmm_free_order
 
     pop r10
@@ -3761,8 +3946,8 @@ mm_alloc_order_flags:
     push r14
     push r15
 
-    mov r12, rcx        ; order
-    mov r13, rdx        ; flags
+    mov r12, rcx
+    mov r13, rdx
 
     call pmm_alloc_order_flags
     test rax, rax
@@ -3774,9 +3959,10 @@ mm_alloc_order_flags:
     mov r15, rax
     mov r14, rax
 
-    mov rcx, 1
-    mov edx, r12d
-    shl rcx, cl
+    mov rax, 1
+    mov ecx, r12d
+    shl rax, cl
+    mov rcx, rax
 
 .zero_loop:
     test rcx, rcx
@@ -5966,6 +6152,869 @@ hhvmm_test:
     pop r12
     ret
 
+;================ HAL_UEFI =================
+
+boot_allocate:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov r13, rcx
+    mov r14, rdx
+
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .fail
+
+    mov rax, [rbx + BS_ALLOCATE_POOL]
+    test rax, rax
+    jz .fail
+
+    mov ecx, EFI_LOADER_DATA
+    mov rdx, r13
+    mov r8, r14
+    call rax
+
+    test rax, rax
+    jnz .fail
+
+    xor eax, eax
+    jmp .done
+
+.fail:
+    mov eax, 1
+
+.done:
+    mov rsp, r12
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+boot_free:
+    push rbx
+    push r12
+    push r13
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov r13, rcx
+
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .fail
+
+    mov rax, [rbx + BS_FREE_POOL]
+    test rax, rax
+    jz .fail
+
+    mov rcx, r13
+    call rax
+
+    test rax, rax
+    jnz .fail
+
+    xor eax, eax
+    jmp .done
+
+.fail:
+    mov eax, 1
+
+.done:
+    mov rsp, r12
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+boot_stall:
+    push rbx
+    push r12
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .fail
+
+    mov rax, [rbx + BS_STALL]
+    test rax, rax
+    jz .fail
+
+    call rax
+
+    test rax, rax
+    jnz .fail
+
+    xor eax, eax
+    jmp .done
+
+.fail:
+    mov eax, 1
+
+.done:
+    mov rsp, r12
+    pop r12
+    pop rbx
+    ret
+
+boot_disable_watchdog:
+    push rbx
+    push r12
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .done
+
+    mov rax, [rbx + BS_SET_WATCHDOG_TIMER]
+    test rax, rax
+    jz .done
+
+    xor ecx, ecx
+    xor edx, edx
+    xor r8d, r8d
+    xor r9d, r9d
+    call rax
+
+.done:
+    xor eax, eax
+    mov rsp, r12
+    pop r12
+    pop rbx
+    ret
+
+boot_video_init:
+    push rbx
+    push r12
+    push r13
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .fail
+
+    mov rax, [rbx + BS_LOCATE_PROTOCOL]
+    test rax, rax
+    jz .fail
+
+    lea rcx, [guid]
+    xor edx, edx
+    lea r8, [gop]
+    call rax
+
+    test rax, rax
+    jnz .fail
+
+    mov rbx, [gop]
+    test rbx, rbx
+    jz .fail
+
+    mov rbx, [rbx + GOP_MODE]
+    test rbx, rbx
+    jz .fail
+
+    mov rax, [rbx + M_FB]
+    test rax, rax
+    jz .fail
+    mov [video + Video.fb], rax
+
+    mov r13, [rbx + M_INF]
+    test r13, r13
+    jz .fail
+
+    mov eax, [r13 + I_HRES]
+    test eax, eax
+    jnz .hres_ok
+    mov eax, 1
+.hres_ok:
+    mov [video + Video.w], rax
+
+    mov eax, [r13 + I_VRES]
+    test eax, eax
+    jnz .vres_ok
+    mov eax, 1
+.vres_ok:
+    mov [video + Video.h], rax
+
+    mov eax, [r13 + I_SL]
+    test eax, eax
+    jnz .stride_ok
+    mov eax, [video + Video.w]
+    test eax, eax
+    jnz .stride_ok
+    mov eax, 1
+.stride_ok:
+    mov [video + Video.sl], rax
+
+    mov rax, [video + Video.sl]
+    cmp qword [video + Video.w], rax
+    jbe .width_ok
+    mov [video + Video.w], rax
+.width_ok:
+
+    mov rax, [video + Video.w]
+    cmp rax, START_X + CHAR_W
+    jae .margin_ok
+    mov qword [margin_x], 0
+.margin_ok:
+
+    mov rax, [video + Video.fb]
+    mov [boot_info + BootInfo.fb], rax
+
+    mov rax, [video + Video.w]
+    mov [boot_info + BootInfo.width], rax
+
+    mov rax, [video + Video.h]
+    mov [boot_info + BootInfo.height], rax
+
+    mov rax, [video + Video.sl]
+    mov [boot_info + BootInfo.stride], rax
+
+    mov qword [video + Video.fg], 0x00FFFFFF
+    mov qword [video + Video.bg], 0x00000000
+
+    xor eax, eax
+
+.done:
+    mov rsp, r12
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.fail:
+    mov eax, 1
+    jmp .done
+
+boot_prepare:
+    push rbx
+    push r12
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov rbx, rdx
+
+    mov rax, [rbx + ST_CONIN_OFFSET]
+    mov [conin], rax
+
+    mov rax, [rbx + ST_BS]
+    test rax, rax
+    jz .fail
+    mov [bs], rax
+
+    call boot_disable_watchdog
+    call boot_video_init
+
+    test eax, eax
+    jnz .fail
+
+    xor eax, eax
+
+.done:
+    mov rsp, r12
+    pop r12
+    pop rbx
+    ret
+
+.fail:
+    mov eax, 1
+    jmp .done
+
+boot_create_timer_event:
+    push rbx
+    push r12
+    push r13
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 48
+
+    mov r13, rcx
+
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .fail
+
+    mov rax, [rbx + BS_CREATE_EVENT]
+    test rax, rax
+    jz .fail
+
+    mov ecx, EVT_TIMER
+    xor edx, edx
+    xor r8d, r8d
+    xor r9d, r9d
+    mov qword [rsp + 32], r13
+    call rax
+
+    test rax, rax
+    jnz .fail
+
+    xor eax, eax
+    jmp .done
+
+.fail:
+    mov eax, 1
+
+.done:
+    mov rsp, r12
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+boot_set_timer:
+    push rbx
+    push r12
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .fail
+
+    mov rax, [rbx + BS_SET_TIMER]
+    test rax, rax
+    jz .fail
+
+    call rax
+
+    test rax, rax
+    jnz .fail
+
+    xor eax, eax
+    jmp .done
+
+.fail:
+    mov eax, 1
+
+.done:
+    mov rsp, r12
+    pop r12
+    pop rbx
+    ret
+
+boot_wait_events:
+    push rbx
+    push r12
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .fail
+
+    mov rax, [rbx + BS_WAIT_FOR_EVENT]
+    test rax, rax
+    jz .fail
+
+    call rax
+
+    test rax, rax
+    jnz .fail
+
+    xor eax, eax
+    jmp .done
+
+.fail:
+    mov eax, 1
+
+.done:
+    mov rsp, r12
+    pop r12
+    pop rbx
+    ret
+
+
+boot_get_memory_map:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 48
+
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .err_bs
+
+    mov r13, [rbx + BS_GET_MEMORY_MAP]
+    test r13, r13
+    jz .err_gmm_ptr
+
+    xor r14, r14
+
+.retry:
+    mov qword [mm_tmp_size], 0
+    mov qword [mm_tmp_buffer], 0
+
+    lea rcx, [mm_tmp_size]
+    xor edx, edx
+    lea r8, [mm_tmp_key]
+    lea r9, [mm_tmp_desc_size]
+    lea r10, [mm_tmp_desc_version]
+    mov [rsp + 32], r10
+    call r13
+
+    cmp rax, 5
+    je .allocate
+
+    mov r10, EFI_BUFFER_TOO_SMALL
+    cmp rax, r10
+    je .allocate
+
+    test rax, rax
+    jnz .err_first
+
+    cmp qword [mm_tmp_size], 0
+    je .err_size
+
+.allocate:
+    mov rdx, [mm_tmp_size]
+    add rdx, 16384
+    mov [mm_tmp_size], rdx
+
+    mov rcx, rdx
+    lea rdx, [mm_tmp_buffer]
+    call boot_allocate
+
+    test rax, rax
+    jnz .err_alloc
+
+    mov rdx, [mm_tmp_buffer]
+    test rdx, rdx
+    jz .err_buf
+
+    lea rcx, [mm_tmp_size]
+    mov rdx, [mm_tmp_buffer]
+    lea r8, [mm_tmp_key]
+    lea r9, [mm_tmp_desc_size]
+    lea r10, [mm_tmp_desc_version]
+    mov [rsp + 32], r10
+    call r13
+
+    test rax, rax
+    jz .success
+
+    cmp rax, 5
+    je .retry_path
+
+    mov r10, EFI_BUFFER_TOO_SMALL
+    cmp rax, r10
+    jne .err_second
+
+.retry_path:
+    mov rcx, [mm_tmp_buffer]
+    test rcx, rcx
+    jz .retry_no_free
+    call boot_free
+
+.retry_no_free:
+    inc r14
+    cmp r14, 8
+    jb .retry
+
+    FAIL_CODE '9'
+
+.success:
+    mov rax, [mm_tmp_buffer]
+    mov [boot_info + BootInfo.mem_map], rax
+
+    mov rax, [mm_tmp_size]
+    mov [boot_info + BootInfo.mem_size], rax
+
+    mov rax, [mm_tmp_key]
+    mov [boot_info + BootInfo.mem_map_key], rax
+
+    mov rax, [mm_tmp_desc_size]
+    mov [boot_info + BootInfo.mem_desc_size], rax
+
+    mov eax, [mm_tmp_desc_version]
+    mov [boot_info + BootInfo.mem_desc_version], eax
+
+    mov rsp, r12
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.err_bs:
+    FAIL_CODE '1'
+
+.err_gmm_ptr:
+    FAIL_CODE '2'
+
+.err_first:
+    FAIL_CODE '3'
+
+.err_size:
+    FAIL_CODE '4'
+
+.err_alloc:
+    FAIL_CODE '5'
+
+.err_buf:
+    FAIL_CODE '6'
+
+.err_second:
+    FAIL_CODE '8'
+
+boot_exit:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+
+    mov rbx, [bs]
+    test rbx, rbx
+    jz .err_bs
+
+    mov r13, [rbx + BS_EXIT_BOOT_SERVICES]
+    test r13, r13
+    jz .err_ptr
+
+    xor r14, r14
+
+.retry:
+    call boot_get_memory_map
+
+    mov rcx, [image_handle]
+    mov rdx, [boot_info + BootInfo.mem_map_key]
+    call r13
+
+    test rax, rax
+    jz .success
+
+    inc r14
+    cmp r14, 3
+    jb .retry
+
+    FAIL_CODE 'X'
+
+.err_bs:
+    FAIL_CODE 'Y'
+
+.err_ptr:
+    FAIL_CODE 'Z'
+
+.success:
+    cli
+
+    mov rsp, r12
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+input_poll:
+    push rbx
+    push r12
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 48
+
+    mov rcx, [conin]
+    test rcx, rcx
+    jz .nokey
+
+    mov rax, [rcx + 8]
+    test rax, rax
+    jz .nokey
+
+    lea rdx, [rsp + 32]
+    call rax
+
+    test rax, rax
+    jnz .nokey
+
+    movzx ecx, word [rsp + 32]
+    movzx eax, word [rsp + 34]
+
+    test eax, eax
+    jnz .have_unicode
+
+    cmp ecx, EFI_SCAN_DELETE
+    je .scan_backspace
+    jmp .nokey
+
+.scan_backspace:
+    mov eax, KEY_BACKSPACE
+    jmp .key_ok
+
+.have_unicode:
+    cmp eax, CHAR_CR
+    jne .not_cr
+    mov eax, KEY_ENTER
+.not_cr:
+
+    cmp eax, KEY_DELETE
+    jne .not_del
+    mov eax, KEY_BACKSPACE
+.not_del:
+
+    cmp eax, KEY_BACKSPACE
+    je .key_ok
+    cmp eax, KEY_ENTER
+    je .key_ok
+    cmp eax, CHAR_TAB
+    je .key_ok
+
+    cmp eax, KEY_SPACE
+    jb .nokey
+    cmp eax, KEY_DELETE
+    ja .nokey
+
+.key_ok:
+    mov rsp, r12
+    pop r12
+    pop rbx
+    ret
+
+.nokey:
+    xor eax, eax
+    mov rsp, r12
+    pop r12
+    pop rbx
+    ret
+
+mmapi_test:
+    push r12
+    push r13
+
+    lea r9, [msg_mmapi_v1]
+    call draw_text
+
+    mov rcx, PAGE_SIZE
+    mov rdx, MM_FLAG_ZERO
+    call mm_alloc_pages
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    cmp byte [r12], 0
+    jne .fail_free
+
+    cmp byte [r12 + PAGE_SIZE - 1], 0
+    jne .fail_free
+
+    mov qword [r12], 0xDEADBEEF
+    cmp qword [r12], 0xDEADBEEF
+    jne .fail_free
+
+    mov rcx, r12
+    mov rdx, PAGE_SIZE
+    call mm_free_pages
+
+    mov rcx, 128
+    mov rdx, MM_FLAG_ZERO
+    call mm_kmem_alloc
+    test rax, rax
+    jz .fail
+    mov r13, rax
+
+    cmp byte [r13], 0
+    jne .fail_kfree
+
+    mov rcx, r13
+    call mm_kmem_free
+
+    mov rcx, 0x1000
+    call mm_phys_to_virt
+    mov r12, rax
+
+    mov rcx, r12
+    call mm_virt_to_phys
+    cmp rax, 0x1000
+    jne .fail
+
+    pop r13
+    pop r12
+
+    lea r9, [msg_mmapi_ok]
+    call draw_text
+    ret
+
+.fail_kfree:
+    mov rcx, r13
+    call mm_kmem_free
+
+.fail_free:
+    mov rcx, r12
+    mov rdx, PAGE_SIZE
+    call mm_free_pages
+
+.fail:
+    pop r13
+    pop r12
+
+    lea r9, [msg_mmapi_fail]
+    call draw_text
+    ret
+
+test_all:
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    lea r9, [msg_testall_start]
+    call draw_text
+
+    mov r15, 0
+
+    lea r9, [msg_test_pmm]
+    call draw_text
+    call pmm_alloc_page
+    test rax, rax
+    jz .fail
+    mov r12, rax
+    mov rcx, rax
+    call pmm_free_page
+    inc r15
+
+    lea r9, [msg_test_vmm]
+    call draw_text
+    cmp byte [vmm_active], 1
+    jne .skip_vmm
+    mov rcx, 0x1000
+    call vmm_translate
+    test rax, rax
+    jz .fail
+    inc r15
+.skip_vmm:
+
+    lea r9, [msg_test_heap]
+    call draw_text
+    call kheap_init
+    test eax, eax
+    jnz .skip_heap
+    mov rcx, 64
+    call kmalloc
+    test rax, rax
+    jz .skip_heap
+    mov r12, rax
+    mov qword [r12], 0xCAFE
+    cmp qword [r12], 0xCAFE
+    jne .fail
+    mov rcx, r12
+    call kfree
+    inc r15
+.skip_heap:
+
+    lea r9, [msg_test_mmapi]
+    call draw_text
+    mov rcx, PAGE_SIZE
+    mov rdx, MM_FLAG_ZERO
+    call mm_alloc_pages
+    test rax, rax
+    jz .fail
+    mov r12, rax
+    cmp byte [r12], 0
+    jne .fail
+    mov qword [r12], 0xBEEF
+    cmp qword [r12], 0xBEEF
+    jne .fail
+    mov rcx, r12
+    mov rdx, PAGE_SIZE
+    call mm_free_pages
+    inc r15
+
+    lea r9, [msg_test_buddy]
+    call draw_text
+    mov rcx, 1
+    call pmm_alloc_order
+    test rax, rax
+    jz .fail
+    mov r12, rax
+    mov qword [r12], 0x1234
+    cmp qword [r12], 0x1234
+    jne .fail
+    mov rcx, r12
+    mov rdx, 1
+    call pmm_free_order
+    inc r15
+
+    lea r9, [msg_test_slab]
+    call draw_text
+    mov rcx, 64
+    call slab_alloc
+    test rax, rax
+    jz .fail
+    mov r12, rax
+    mov byte [r12], 0xAA
+    cmp byte [r12], 0xAA
+    jne .fail
+    mov rcx, 64
+    mov rdx, r12
+    call slab_free
+    inc r15
+
+    lea r9, [msg_test_phys]
+    call draw_text
+    mov rcx, 0x2000
+    call mm_phys_to_virt
+    mov r12, rax
+    mov rcx, r12
+    call mm_virt_to_phys
+    cmp rax, 0x2000
+    jne .fail
+    inc r15
+
+    lea r9, [msg_testall_done]
+    call draw_text
+
+    mov rcx, r15
+    call print_hex64
+
+    lea r9, [msg_testall_pass]
+    call draw_text
+
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+.fail:
+    lea r9, [msg_testall_fail]
+    call draw_text
+
+    mov rcx, r15
+    call print_hex64
+
+    lea r9, [msg_testall_pass]
+    call draw_text
+
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
 cmd_execute:
     cmp qword [cmd_len], 0
     je .done
@@ -6069,6 +7118,16 @@ cmd_execute:
     call cmd_is
     test eax, eax
     jnz .hhvmm
+
+    lea rsi, [str_cmd_mmapi]
+    call cmd_is
+    test eax, eax
+    jnz .mmapi
+
+    lea rsi, [str_cmd_testall]
+    call cmd_is
+    test eax, eax
+    jnz .testall
 
     lea rsi, [str_cmd_exit]
     call cmd_is
@@ -6408,6 +7467,14 @@ cmd_execute:
     call hhvmm_test
     ret
 
+.mmapi:
+    call mmapi_test
+    ret
+
+.testall:
+    call test_all
+    ret
+
 .exit:
     jmp exit_boot_services_sequence
 
@@ -6434,57 +7501,7 @@ exit_boot_services_sequence:
     jmp .halt
 
 exit_boot_services:
-    push rbx
-    push r12
-    push r13
-    push r14
-
-    mov r12, rsp
-    and rsp, -16
-    sub rsp, 32
-
-    mov rbx, [bs]
-    test rbx, rbx
-    jz .err_bs
-
-    mov r13, [rbx + BS_EXIT_BOOT_SERVICES]
-    test r13, r13
-    jz .err_ptr
-
-    xor r14, r14
-
-.retry:
-    call get_memory_map
-
-    mov rcx, [image_handle]
-    mov rdx, [boot_info + BootInfo.mem_map_key]
-
-    call r13
-
-    test rax, rax
-    jz .success
-
-    inc r14
-    cmp r14, 3
-    jb .retry
-
-    FAIL_CODE 'X'
-
-.err_bs:
-    FAIL_CODE 'Y'
-
-.err_ptr:
-    FAIL_CODE 'Z'
-
-.success:
-    cli
-
-    mov rsp, r12
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    ret
+    jmp boot_exit
 
 fail:
     mov al, '0'
@@ -6598,10 +7615,29 @@ istruc BootInfo
     at BootInfo.mem_desc_size,     dq 0
     at BootInfo.mem_desc_version,  dq 0
 
+    at BootInfo.mem_map_copy,      dq 0
+    at BootInfo.mem_map_copy_size, dq 0
+
     at BootInfo.pmm_bitmap,        dq 0
     at BootInfo.pmm_total_pages,   dq 0
     at BootInfo.pmm_free_pages,    dq 0
 iend
+
+align 8
+mm_region_count:
+    dq 0
+
+align 8
+mm_regions:
+    times (MM_REGION_MAX * 24) db 0
+
+align 8
+pmm_total_pages_actual:
+    dq 0
+
+align 8
+pmm_reserved_count:
+    dq 0
 
 cursor_x:
     dq 0
@@ -6706,6 +7742,7 @@ msg_help:
     db "  vmm         - vmm status",10
     db "  detect      - system info",10
     db "  serial      - serial test",10
+    db "  test        - run all tests",10
     db "  pmmtest     - test PMM allocator",10
     db "  vmmtest     - test VMM mapping",10
     db "  highmap     - map physical memory to higher-half",10
@@ -6720,7 +7757,7 @@ msg_help:
     db "  zonetest    - test Zones/DMA",10
     db "  slabtest    - test Slab allocator",10
     db "  hhvmm       - test Higher-Half VMM",10
-    db "  kernel      - enter kernel",10
+    db "  mmapi       - test MM API",10
     db "  exit        - exit boot services",10
     db 0
 
@@ -7052,6 +8089,54 @@ zone_dma_limit_val:
 zone_dma32_limit_val:
     dq ZONE_DMA32_LIMIT
 
+str_cmd_mmapi:
+    db "mmapi",0
+
+msg_mmapi_v1:
+    db "MM API test",10,0
+
+msg_mmapi_ok:
+    db "MM API: OK",10,0
+
+msg_mmapi_fail:
+    db "MM API: FAIL",10,0
+
+str_cmd_testall:
+    db "test",0
+
+msg_testall_start:
+    db "Running all tests...",10,0
+
+msg_test_pmm:
+    db "  PMM alloc/free...",10,0
+
+msg_test_vmm:
+    db "  VMM translate...",10,0
+
+msg_test_heap:
+    db "  Heap alloc/free...",10,0
+
+msg_test_mmapi:
+    db "  MM API...",10,0
+
+msg_test_buddy:
+    db "  Buddy order...",10,0
+
+msg_test_slab:
+    db "  Slab alloc/free...",10,0
+
+msg_test_phys:
+    db "  Phys/Virt...",10,0
+
+msg_testall_done:
+    db "Tests done. Passed: 0x",0
+
+msg_testall_pass:
+    db " ",10,0
+
+msg_testall_fail:
+    db "FAILED at test 0x",0
+
 font_table:
     db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
     db 0x18,0x18,0x18,0x18,0x18,0x00,0x18,0x00
@@ -7172,7 +8257,51 @@ pmm_cache:
 
 align 8
 pml4_ptr:             dq 0
+align 16
+gdt:
+    dq 0x0000000000000000
+    dq 0x00209A0000000000
+    dq 0x0000920000000000
+    dq 0x0020FA0000000000
+    dq 0x0000F20000000000
+    dq 0x0000000000000000
+    dq 0x0000000000000000
+gdt_end:
 
+align 16
+gdt_ptr:
+    dw gdt_end - gdt - 1
+    dq gdt
+
+align 16
+tss:
+    dd 0
+    dq kernel_stack_top
+    dq 0
+    dq 0
+    dq 0
+    dq ist_stack_top
+    dq 0
+    dq 0
+    dq 0
+    dq 0
+    dq 0
+    dq 0
+    dq 0
+    dd 0
+    dw 0
+    dw 104
+tss_end:
+
+align 4096
+kernel_stack_bottom:
+    times 4096 db 0
+kernel_stack_top:
+
+align 4096
+ist_stack_bottom:
+    times 4096 db 0
+ist_stack_top:
 align 16
 idt:
     times 256 * 16 db 0
@@ -7195,3 +8324,4 @@ pmm_bitmap:
 align 16
 buddy_static_pool:
     times (2 * BUDDY_STATIC_BLOCK_SIZE) db 0
+
