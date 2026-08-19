@@ -200,7 +200,7 @@ _e:
     mov rdx, r12
     call boot_prepare
     test eax, eax
-    jnz fail
+    jnz .boot_prepare_fail
 
     call console_clear
 
@@ -314,6 +314,10 @@ _e:
     call cursor_toggle
     jmp .busy_loop
 
+.boot_prepare_fail:
+    mov al, 'B'
+    jmp fail_code
+
 process_key:
     sub rsp, 8
 
@@ -360,6 +364,12 @@ console_clear:
 
     mov eax, [video + Video.bg]
     rep stosd
+
+    ; Clearing the framebuffer must also reset the console cursor.
+    ; Otherwise the kernel banner starts where the bootloader left off.
+    mov rax, [margin_x]
+    mov [video + Video.cx], rax
+    mov qword [video + Video.cy], START_Y
 
     mov byte [cursor_shown], 0
 
@@ -3235,29 +3245,46 @@ tss_init:
     mov [r12 + 4], rax
 
     lea rax, [ist_stack_top]
-    mov [r12 + 20], rax
+    mov [r12 + 36], rax
 
     lea rbx, [gdt]
     add rbx, 0x28
 
+    ; Build a valid 64-bit available TSS descriptor (16 bytes).
+    ; descriptor = limit[0:15] | base[0:23]<<16 | type<<40 |
+    ;              limit[16:19]<<48 | base[24:31]<<56
     lea rax, [tss]
-    mov ecx, eax
-    shr eax, 24
-    shl eax, 8
-    or ecx, eax
-    mov [rbx], ecx
+    mov rdx, rax
+    mov rcx, tss_end - tss - 1
 
-    mov eax, tss_end - tss - 1
-    mov ecx, eax
-    shl ecx, 16
-    mov eax, 0x89
-    shl eax, 40
-    or ecx, eax
-    mov [rbx + 4], ecx
+    mov rbx, rcx
+    and ebx, 0xFFFF
 
-    lea rax, [tss]
-    shr rax, 32
-    mov [rbx + 8], eax
+    mov r8, rdx
+    and r8d, 0xFFFFFF
+    shl r8, 16
+    or rbx, r8
+
+    mov r8, 0x89
+    shl r8, 40
+    or rbx, r8
+
+    mov r8, rcx
+    shr r8, 16
+    and r8d, 0x0F
+    shl r8, 48
+    or rbx, r8
+
+    mov r8, rdx
+    shr r8, 24
+    and r8d, 0xFF
+    shl r8, 56
+    or rbx, r8
+
+    mov [gdt + 0x28], rbx
+    mov r8, rdx
+    shr r8, 32
+    mov [gdt + 0x30], r8
 
     mov ax, 0x28
     ltr ax
@@ -4156,12 +4183,23 @@ cmd_enter:
     push rcx
 
     mov rcx, [cmd_len]
+    test rcx, rcx
+    jz .empty
+
     lea rdi, [cmd_buf]
     mov byte [rdi + rcx], 0
 
     call cmd_execute
 
     mov qword [cmd_len], 0
+    jmp .finish
+
+.empty:
+    ; Empty Enter is not a command. Do not enter the command dispatcher.
+    xor eax, eax
+    mov qword [cmd_len], 0
+
+.finish:
 
     pop rcx
     pop rdi
@@ -7513,10 +7551,14 @@ kernel_entry:
 
     call console_clear
 
-    lea r9, [msg_kernel_banner]
-    call draw_text
+    ; Start the kernel shell with a clean command state.
+    mov qword [cmd_len], 0
+    lea rdi, [cmd_buf]
+    xor eax, eax
+    mov ecx, CMD_MAX
+    rep stosb
 
-    lea r9, [prompt_str]
+    lea r9, [msg_kernel_banner]
     call draw_text
 
     call cursor_draw
@@ -8301,9 +8343,18 @@ ps2_scancode_table:
     db '2', '3', '0', '.', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
 msg_kernel_banner:
-    db "0xDEAD OS - Kernel Mode",10
-    db "UEFI services terminated.",10
-    db 0
+    db "===============================================================",10
+    db "                     0xDEAD OPERATING SYSTEM",10
+    db "                         KERNEL MODE",10,10
+    db "  [ OK ] UEFI Boot Services terminated",10
+    db "  [ OK ] GDT initialized",10
+    db "  [ OK ] TSS initialized",10
+    db "  [ OK ] IDT initialized",10
+    db "  [ OK ] Virtual Memory activated",10
+    db "  [ OK ] Kernel stack initialized",10,10
+    db "---------------------------------------------------------------",10,10
+    db "                       KERNEL READY",10,10
+    db "                     0xDEAD kernel> ",0
 
 font_table:
     db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
