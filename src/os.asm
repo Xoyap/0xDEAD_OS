@@ -56,6 +56,35 @@ global _e
 
 %define COM1                   0x3F8
 
+;================ LOCAL APIC / TIMER =================
+%define MSR_APIC_BASE          0x1B
+%define APIC_BASE_ENABLE       (1 << 11)
+%define APIC_BASE_X2APIC       (1 << 10)
+%define APIC_BASE_MASK         0xFFFFF000
+
+%define LAPIC_ID                0x020
+%define LAPIC_TPR               0x080
+%define LAPIC_EOI               0x0B0
+%define LAPIC_SVR               0x0F0
+%define LAPIC_ESR               0x280
+%define LAPIC_LVT_TIMER         0x320
+%define LAPIC_TIMER_INIT        0x380
+%define LAPIC_TIMER_CUR         0x390
+%define LAPIC_TIMER_DIV         0x3E0
+
+%define LAPIC_TIMER_VECTOR      32
+%define LAPIC_SVR_ENABLE        (1 << 8)
+%define LAPIC_LVT_MASKED        (1 << 16)
+%define LAPIC_LVT_PERIODIC      (1 << 17)
+%define LAPIC_TIMER_DIV_16      0x3
+
+%define LAPIC_VIRT_BASE          0xFFFF920000000000
+%define LAPIC_CALIBRATION_MS     50
+%define PIT_INPUT_HZ             1193182
+%define PIT_CALIBRATION_DIV     59659
+%define APIC_TIMER_HZ_DEFAULT   1000
+%define APIC_TIMER_PERIOD_MS     1
+
 %define PAGE_SHIFT             12
 %define PAGE_SIZE              4096
 
@@ -3033,6 +3062,18 @@ ISR_NOERR 29
 ISR_ERR   30
 ISR_NOERR 31
 
+; Local APIC timer IRQ.  Vector 32 is installed explicitly by idt_init_full.
+isr_timer:
+    push qword 0
+    push qword LAPIC_TIMER_VECTOR
+    jmp isr_common
+
+; Local APIC spurious vector. No EOI is required for a spurious interrupt.
+isr_spurious:
+    push qword 0
+    push qword 0xFF
+    jmp isr_common
+
 align 8
 isr_stub_table:
     dd isr_stub_0 - isr_stub_table
@@ -3078,6 +3119,11 @@ isr_common:
     cli
 
     mov rcx, [rsp]
+    cmp rcx, LAPIC_TIMER_VECTOR
+    je .timer_irq
+    cmp rcx, 0xFF
+    je .spurious_irq
+
     mov rdx, [rsp + 8]
     mov r8, [rsp + 16]
 
@@ -3086,6 +3132,51 @@ isr_common:
     sub rsp, 32
 
     call panic_exception
+
+.timer_irq:
+    ; Interrupt entry already cleared IF. Preserve all GPRs before touching
+    ; the timer state, then return through the original hardware frame.
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    call lapic_timer_irq
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    add rsp, 16                 ; discard vector + synthetic error code
+    iretq
+
+.spurious_irq:
+    inc qword [lapic_spurious_count]
+    add rsp, 16
+    iretq
 
 panic_exception:
     cli
@@ -3418,6 +3509,36 @@ idt_init_full:
     jmp .fill_default
 
 .load_idt:
+    ; Override IDT vector 32 with the Local APIC timer ISR.
+    ; This must execute after the default-fill loop and before LIDT.
+    lea rax, [isr_timer]
+    lea r14, [idt + LAPIC_TIMER_VECTOR * 16]
+    mov ecx, eax
+    mov word [r14 + 0], cx
+    mov word [r14 + 2], 0x08
+    mov byte [r14 + 4], 0
+    mov byte [r14 + 5], 0x8E
+    shr eax, 16
+    mov word [r14 + 6], ax
+    shr eax, 16
+    mov dword [r14 + 8], eax
+    mov dword [r14 + 12], 0
+
+    ; Vector 0xFF is the LAPIC spurious vector. It must not use isr_default,
+    ; because isr_default is reserved for the pre-kernel firmware handoff.
+    lea rax, [isr_spurious]
+    lea r14, [idt + 0xFF * 16]
+    mov ecx, eax
+    mov word [r14 + 0], cx
+    mov word [r14 + 2], 0x08
+    mov byte [r14 + 4], 0
+    mov byte [r14 + 5], 0x8E
+    shr eax, 16
+    mov word [r14 + 6], ax
+    shr eax, 16
+    mov dword [r14 + 8], eax
+    mov dword [r14 + 12], 0
+
     lea rax, [idt]
     mov [new_idtr_base], rax
     lidt [new_idtr_limit]
@@ -7392,6 +7513,11 @@ cmd_execute:
     test eax, eax
     jnz .mmapi
 
+    lea rsi, [str_cmd_timer]
+    call cmd_is
+    test eax, eax
+    jnz .timer
+
     lea rsi, [str_cmd_testall]
     call cmd_is
     test eax, eax
@@ -7747,6 +7873,59 @@ cmd_execute:
     call mmapi_test
     ret
 
+.timer:
+    lea r9, [msg_timer_header]
+    call draw_text
+    lea r9, [str_timer_state]
+    call draw_text
+    cmp byte [lapic_timer_started], 1
+    jne .timer_stopped
+    lea r9, [str_timer_running]
+    call draw_text
+    jmp .timer_state_done
+.timer_stopped:
+    lea r9, [str_timer_stopped]
+    call draw_text
+.timer_state_done:
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_timer_ticks]
+    call draw_text
+    mov rcx, [lapic_timer_ticks]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_timer_uptime]
+    call draw_text
+    mov rcx, [timer_uptime_ms]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_timer_ticks_ms]
+    call draw_text
+    mov rcx, [lapic_ticks_per_ms]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_timer_initial]
+    call draw_text
+    mov ecx, [lapic_initial_count]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_timer_spurious]
+    call draw_text
+    mov rcx, [lapic_spurious_count]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+    ret
+
 .testall:
     call test_all
     ret
@@ -7799,6 +7978,283 @@ exit_boot_services_sequence:
     cli
     hlt
     jmp .kernel_transfer_unreachable
+
+;================ LOCAL APIC / TIMER =================
+
+; Mask the legacy 8259 PIC.  The kernel uses the Local APIC from this point
+; onward, while the keyboard remains polled until a real input driver exists.
+pic_mask_all:
+    mov al, 0xFF
+    out 0x21, al
+    out 0xA1, al
+    ret
+
+; Read IA32_APIC_BASE and force legacy xAPIC mode.  x2APIC is deliberately
+; disabled for this first APIC implementation because the timer is accessed
+; through the LAPIC MMIO page.
+apic_detect:
+    push rbx
+
+    mov eax, 1
+    cpuid
+    test edx, (1 << 9)          ; CPUID.01H:EDX.APIC
+    jz .unsupported
+
+    mov ecx, MSR_APIC_BASE
+    rdmsr
+
+    and eax, 0xFFFFF000
+    mov ebx, eax
+
+    ; Keep the APIC enabled and leave x2APIC mode disabled.
+    mov ecx, MSR_APIC_BASE
+    rdmsr
+    and eax, ~(APIC_BASE_X2APIC)
+    or eax, APIC_BASE_ENABLE
+    wrmsr
+
+    mov eax, ebx
+    mov [lapic_phys_base], rax
+    mov byte [lapic_supported], 1
+    xor eax, eax
+    pop rbx
+    ret
+
+.unsupported:
+    mov byte [lapic_supported], 0
+    mov eax, 1
+    pop rbx
+    ret
+
+; Calibrate the Local APIC timer against PIT channel 2.
+; PIT channel 2 is used only as a short reference clock. The LAPIC timer
+; remains masked until lapic_timer_start so startup tests cannot lose ticks.
+lapic_timer_calibrate:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    ; Save speaker/PIT control state.
+    in al, 0x61
+    mov r14b, al
+
+    mov rbx, [lapic_virt_base]
+    test rbx, rbx
+    jz .fail_restore
+
+    ; LAPIC divide = 16, free-running countdown during calibration.
+    mov dword [rbx + LAPIC_TIMER_DIV], LAPIC_TIMER_DIV_16
+    mov dword [rbx + LAPIC_LVT_TIMER], LAPIC_LVT_MASKED
+    mov dword [rbx + LAPIC_TIMER_INIT], 0xFFFFFFFF
+
+    ; PIT channel 2, mode 0, lobyte/hibyte, binary.
+    mov al, r14b
+    and al, 0xFC
+    or al, 0x01
+    out 0x61, al
+
+    mov al, 0xB0
+    out 0x43, al
+    mov ax, PIT_CALIBRATION_DIV       ; 59659 ~= 50 ms
+    out 0x42, al
+    mov al, ah
+    out 0x42, al
+
+    ; Timeout prevents a dead PIT from hanging the kernel forever.
+    mov r12, 0x20000000
+.wait_pit:
+    in al, 0x61
+    test al, 0x20
+    jnz .pit_done
+    dec r12
+    jnz .wait_pit
+    jmp .fail_restore
+
+.pit_done:
+    mov r13d, dword [rbx + LAPIC_TIMER_CUR]
+    mov eax, 0xFFFFFFFF
+    sub eax, r13d
+    test eax, eax
+    jz .fail_restore
+
+    xor edx, edx
+    mov ecx, LAPIC_CALIBRATION_MS
+    div ecx                         ; LAPIC ticks per millisecond
+    test eax, eax
+    jz .fail_restore
+    mov [lapic_ticks_per_ms], rax
+
+    ; Compute the 1 ms periodic initial count.
+    mov rdx, rax
+    imul rdx, APIC_TIMER_PERIOD_MS
+    test rdx, rdx
+    jz .fail_restore
+    mov rcx, 0x100000000
+    cmp rdx, rcx
+    jae .fail_restore
+    mov [lapic_initial_count], edx
+
+    mov dword [rbx + LAPIC_TIMER_INIT], 0
+    mov al, r14b
+    out 0x61, al
+
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.fail_restore:
+    mov rax, [lapic_virt_base]
+    test rax, rax
+    jz .restore_only
+    mov dword [rax + LAPIC_TIMER_INIT], 0
+.restore_only:
+    mov al, r14b
+    out 0x61, al
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+
+; Start the calibrated periodic timer. This is deliberately separate from
+; initialization: IF stays clear until all kernel startup/self-tests finish.
+lapic_timer_start:
+    push rbx
+    mov rbx, [lapic_virt_base]
+    test rbx, rbx
+    jz .fail
+    mov eax, [lapic_initial_count]
+    test eax, eax
+    jz .fail
+
+    mov dword [rbx + LAPIC_ESR], 0
+    mov dword [rbx + LAPIC_EOI], 0
+    mov dword [rbx + LAPIC_TPR], 0
+
+    ; Vector 32, periodic, unmasked.
+    mov eax, LAPIC_TIMER_VECTOR | LAPIC_LVT_PERIODIC
+    mov dword [rbx + LAPIC_LVT_TIMER], eax
+    mov eax, [lapic_initial_count]
+    mov dword [rbx + LAPIC_TIMER_INIT], eax
+
+    mov byte [lapic_timer_started], 1
+    mov qword [lapic_timer_ticks], 0
+    mov qword [timer_uptime_ms], 0
+    mov qword [last_cursor_tick], 0
+    mov al, 'S'
+    call debug_stage
+
+    pop rbx
+    xor eax, eax
+    ret
+.fail:
+    pop rbx
+    mov eax, 1
+    ret
+
+lapic_timer_stop:
+    push rbx
+    mov rbx, [lapic_virt_base]
+    test rbx, rbx
+    jz .done
+    mov dword [rbx + LAPIC_LVT_TIMER], LAPIC_LVT_MASKED
+    mov dword [rbx + LAPIC_TIMER_INIT], 0
+    mov byte [lapic_timer_started], 0
+.done:
+    pop rbx
+    ret
+
+; Timer IRQ hot path: keep it tiny for future scheduler use.
+lapic_timer_irq:
+    inc qword [lapic_timer_ticks]
+    inc qword [timer_uptime_ms]
+    mov rax, [lapic_virt_base]
+    test rax, rax
+    jz .done
+    mov dword [rax + LAPIC_EOI], 0
+.done:
+    ret
+
+; Complete Local APIC + timer initialization. Timer remains masked until
+; lapic_timer_start is called immediately before STI.
+apic_timer_init:
+    push rbx
+    push r12
+
+    call apic_detect
+    test eax, eax
+    jnz .fail_detect
+    mov al, 'D'
+    call debug_stage
+
+    ; Disable legacy 8259 delivery before any LAPIC IRQ can be exposed.
+    call pic_mask_all
+
+    ; Map LAPIC MMIO through the existing identity map, uncached.
+    mov rdx, [lapic_phys_base]
+    mov rcx, rdx
+    mov r8, PAGE_WRITABLE | PAGE_CACHE_DISABLE | PAGE_GLOBAL
+    call vmm_map_4k
+    test eax, eax
+    jnz .fail_map
+    mov al, 'M'
+    call debug_stage
+
+    mov rax, [lapic_phys_base]
+    mov [lapic_virt_base], rax
+    mov rbx, rax
+
+    mov dword [rbx + LAPIC_TPR], 0
+    mov eax, LAPIC_SVR_ENABLE | 0xFF
+    mov dword [rbx + LAPIC_SVR], eax
+    mov dword [rbx + LAPIC_LVT_TIMER], LAPIC_LVT_MASKED
+    mov dword [rbx + LAPIC_EOI], 0
+    mov al, 'E'
+    call debug_stage
+
+    mov eax, dword [rbx + LAPIC_ID]
+    mov [lapic_id], rax
+
+    call lapic_timer_calibrate
+    test eax, eax
+    jnz .fail_calibrate
+
+    mov qword [lapic_timer_ticks], 0
+    mov qword [timer_uptime_ms], 0
+    mov qword [last_cursor_tick], 0
+    mov byte [lapic_timer_ready], 1
+    mov byte [lapic_timer_started], 0
+
+    mov al, 'T'
+    call debug_stage
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+
+.fail_detect:
+    mov al, 'd'
+    call debug_stage
+    jmp .fail
+.fail_map:
+    mov al, 'm'
+    call debug_stage
+    jmp .fail
+.fail_calibrate:
+    mov al, 'c'
+    call debug_stage
+.fail:
+    mov byte [lapic_timer_ready], 0
+    mov byte [lapic_timer_started], 0
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
 
 kernel_entry:
     cli
@@ -7876,11 +8332,35 @@ kernel_entry:
     mov al, 'h'
     call debug_stage
 
+    ; Stage 07: Local APIC + periodic timer.  Keep interrupts disabled until
+    ; the complete LAPIC/IDT state is installed and validated.
+    mov byte [kernel_stage], 9
+    mov al, 'A'
+    call debug_stage
+    lea rsi, [s_kern_apic]
+    call serial_puts
+    call apic_timer_init
+    test eax, eax
+    jnz .apic_fail
+
+    lea rsi, [s_kern_apic_ready]
+    call serial_puts
+
     lea rsi, [s_kern_console]
     call serial_puts
     call console_clear
 
     jmp .kernel_console_ready
+
+.apic_fail:
+    mov al, 'A'
+    call debug_stage
+    lea rsi, [s_kern_apic_fail]
+    call serial_puts
+    cli
+.apic_halt:
+    hlt
+    jmp .apic_halt
 
 .hh_fail:
     mov al, '!'
@@ -7931,6 +8411,15 @@ kernel_entry:
     call cursor_draw
     mov dword [blink_counter], 0
 
+    ; Hardware interrupts are now safe: vector 32 is owned by the LAPIC timer
+    ; and the legacy PIC is fully masked.
+    cmp byte [lapic_timer_ready], 1
+    jne .kernel_loop
+    call lapic_timer_start
+    test eax, eax
+    jnz .apic_fail
+    sti
+
 .kernel_loop:
     call ps2_keyboard_read
     test al, al
@@ -7943,14 +8432,19 @@ kernel_entry:
     jmp .kernel_loop
 
 .no_key:
+    ; With IF=1, HLT is the real kernel idle primitive. LAPIC timer IRQs
+    ; wake the CPU every millisecond, so PS/2 polling remains responsive.
+    cmp byte [lapic_timer_started], 1
+    jne .legacy_idle
+    hlt
+
+    ; Timer IRQ is intentionally not allowed to touch the framebuffer.
+    ; Keep the original solid cursor stable while validating the keyboard
+    ; path with the new APIC timer enabled.
+    jmp .kernel_loop
+
+.legacy_idle:
     call stall_1ms_kernel
-
-    inc dword [blink_counter]
-    cmp dword [blink_counter], CURSOR_BLINK_MS
-    jb .kernel_loop
-
-    mov dword [blink_counter], 0
-    call cursor_toggle
     jmp .kernel_loop
 
 ;================ CORE ARCHITECTURE SELFTEST =================
@@ -8594,6 +9088,35 @@ timer_event:
 timer_ready:
     db 0
 
+; Native-kernel Local APIC state.
+lapic_supported:
+    db 0
+lapic_timer_ready:
+    db 0
+lapic_timer_started:
+    db 0
+
+align 8
+lapic_phys_base:
+    dq 0
+lapic_virt_base:
+    dq 0
+lapic_id:
+    dq 0
+lapic_ticks_per_ms:
+    dq 0
+lapic_initial_count:
+    dd 0
+align 8
+lapic_timer_ticks:
+    dq 0
+timer_uptime_ms:
+    dq 0
+lapic_spurious_count:
+    dq 0
+last_cursor_tick:
+    dq 0
+
 cursor_shown:
     db 0
 
@@ -8797,6 +9320,12 @@ s_kern_hh_fail:
     db "[KERN PANIC] higher-half address-space activation failed",10,0
 s_kern_console:
     db "[KERN] console",10,0
+s_kern_apic:
+    db "[KERN] apic_timer_init",10,0
+s_kern_apic_ready:
+    db "[KERN] Local APIC + timer ready",10,0
+s_kern_apic_fail:
+    db "[KERN PANIC] Local APIC / timer initialization failed",10,0
 
 msg_serial_sent:
     db "Serial: test message sent.",10,0
@@ -8858,6 +9387,9 @@ str_cmd_pmmstress:
 str_cmd_vmmstress:
     db "vmmstress",0
 
+str_cmd_timer:
+    db "timer",0
+
 str_cmd_exit:
     db "exit",0
 
@@ -8887,8 +9419,28 @@ msg_help:
     db "  slabtest    - test Slab allocator",10
     db "  hhvmm       - test Higher-Half VMM",10
     db "  mmapi       - test MM API",10
+    db "  timer       - show Local APIC timer state",10
     db "  exit        - exit boot services",10
     db 0
+
+msg_timer_header:
+    db "Local APIC Timer:",10,0
+str_timer_state:
+    db "  state: ",0
+str_timer_running:
+    db "RUNNING",0
+str_timer_stopped:
+    db "STOPPED",0
+str_timer_ticks:
+    db "  ticks: 0x",0
+str_timer_uptime:
+    db "  uptime_ms: 0x",0
+str_timer_ticks_ms:
+    db "  lapic_ticks_per_ms: 0x",0
+str_timer_initial:
+    db "  initial_count: 0x",0
+str_timer_spurious:
+    db "  spurious_irqs: 0x",0
 
 msg_unknown_cmd:
     db "Unknown command. Type 'help'.",10,0
