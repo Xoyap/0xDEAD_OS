@@ -130,7 +130,8 @@ global _e
 %define MEM_TYPE_LOADER_DATA 2
 
 %define PHYS_MAP_BASE          0xFFFF910000000000
-%define HH_DIRECT_MAP_LIMIT    0x100000000   ; 4 GiB
+%define HH_DIRECT_MAP_LIMIT    0x1000000000  ; 64 GiB maximum HHDM RAM window
+%define HH_MAP_FLAGS           (PAGE_WRITABLE | PAGE_GLOBAL)
 
 %macro MASK_FRAME 1
     shl %1, 12
@@ -139,6 +140,9 @@ global _e
 %endmacro
 
 %define CMD_MAX 64
+%define PMM_STRESS_COUNT 32
+%define VMM_STRESS_COUNT 16
+%define VMM_STRESS_BASE 0xFFFFB00000000000
 
 %macro FAIL_CODE 1
     mov al, %1
@@ -202,6 +206,9 @@ _e:
     test eax, eax
     jnz .boot_prepare_fail
 
+    ; UEFI HAL has completed its firmware-side initialization.
+    mov byte [hal_uefi_ready], 1
+
     call console_clear
 
     mov rax, [margin_x]
@@ -215,6 +222,14 @@ _e:
 
     call mem_init
     call detect_memory_top
+
+    ; Unified memory layer is now backed by the firmware memory map.
+    cmp qword [boot_info + BootInfo.pmm_bitmap], 0
+    je .memory_manager_not_ready
+    cmp qword [boot_info + BootInfo.pmm_total_pages], 0
+    je .memory_manager_not_ready
+    mov byte [memory_manager_ready], 1
+.memory_manager_not_ready:
 
     lea rsi, [s_mem_init]
     call serial_puts
@@ -995,6 +1010,16 @@ draw_char:
     pop rdi
     pop rsi
     pop rbx
+    ret
+
+;================ EARLY KERNEL DEBUG =================
+; Uses QEMU/ISA debug port 0xE9. This path does not depend on framebuffer,
+; UEFI console services, IDT, or the kernel heap.
+debug_stage:
+    push rdx
+    mov dx, 0x00E9
+    out dx, al
+    pop rdx
     ret
 
 serial_init:
@@ -3103,6 +3128,14 @@ panic_exception:
     mov rcx, r13
     call print_hex64
 
+    cmp r15, 14
+    jne .no_cr2
+    lea r9, [str_cr2]
+    call draw_text
+    mov rcx, cr2
+    call print_hex64
+
+.no_cr2:
     lea r9, [str_halted]
     call draw_text
 
@@ -3217,6 +3250,12 @@ idt_init_minimal:
 
 gdt_init:
     cli
+
+    ; Enable CR4.PGE so kernel mappings marked GLOBAL survive CR3 switches.
+    mov rax, cr4
+    or rax, (1 << 7)
+    mov cr4, rax
+
     lgdt [gdt_ptr]
 
     mov ax, 0x10
@@ -3286,6 +3325,10 @@ tss_init:
     shr r8, 32
     mov [gdt + 0x30], r8
 
+    ; No I/O bitmap is present yet. Point the I/O-map base at the end of the
+    ; TSS so all port I/O remains denied/controlled until a later driver layer.
+    mov word [r12 + 102], tss_end - tss
+
     mov ax, 0x28
     ltr ax
 
@@ -3326,7 +3369,19 @@ idt_init_full:
     mov ecx, eax
     mov word [r14 + 0], cx
     mov word [r14 + 2], 0x08
-    mov byte [r14 + 4], 1
+    ; IST1 is reserved for catastrophic paths: NMI(2), Double Fault(8),
+    ; and Machine Check(18). Ordinary faults stay on the current kernel stack.
+    xor edx, edx
+    cmp r13, 2
+    je .set_ist
+    cmp r13, 8
+    je .set_ist
+    cmp r13, 18
+    jne .ist_done
+.set_ist:
+    mov dl, 1
+.ist_done:
+    mov byte [r14 + 4], dl
     mov byte [r14 + 5], 0x8E
     shr eax, 16
     mov word [r14 + 6], ax
@@ -5946,32 +6001,291 @@ vmm_map_2mb_pml4:
     ret
 
 phys_to_virt:
+    ; Translate only physical addresses inside the active HHDM window.
+    ; Carry/limit checks prevent silent wraparound into a non-canonical VA.
+    mov rax, [hh_direct_map_limit_val]
+    test rax, rax
+    jz .fail
+    cmp rcx, rax
+    jae .fail
     mov rax, [phys_map_base_val]
     add rax, rcx
+    jc .fail
+    ret
+.fail:
+    xor eax, eax
     ret
 
-hh_init:
+virt_to_phys:
+    mov rax, [phys_map_base_val]
+    cmp rcx, rax
+    jb .fail
+    sub rcx, rax
+    cmp rcx, [hh_direct_map_limit_val]
+    jae .fail
+    mov rax, rcx
+    ret
+.fail:
+    xor eax, eax
+    ret
+
+; 4 KiB mapper operating on an explicit PML4. Used while constructing a
+; second address space before it becomes active.
+vmm_map_4k_pml4:
+    push rbx
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 24
+
+    mov r11, rcx                ; PML4 (saved on stack; allocator may clobber r11)
+    mov [rsp], r11
+    mov r12, rdx                ; virtual
+    mov r13, r8                 ; physical
+    mov r15, r9                 ; flags
+
+    mov rbx, r11
+
+    mov rax, r12
+    shr rax, 39
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+    mov rax, [rbx + r14*8]
+    test al, PAGE_PRESENT
+    jnz .pdpt
+    call pmm_alloc_page
+    test rax, rax
+    jz .oom
+    mov rcx, rax
+    call zero_page
+    mov rbx, [rsp]
+    or rax, PAGE_PRESENT | PAGE_WRITABLE
+    mov [rbx + r14*8], rax
+.pdpt:
+    mov rax, [rbx + r14*8]
+    test al, PAGE_SIZE_FLAG
+    jnz .conflict
+    MASK_FRAME rax
+    mov rbx, rax
+
+    mov rax, r12
+    shr rax, 30
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+    mov rax, [rbx + r14*8]
+    test al, PAGE_PRESENT
+    jnz .pd
+    mov [rsp + 8], rbx
+    call pmm_alloc_page
+    test rax, rax
+    jz .oom
+    mov rcx, rax
+    call zero_page
+    mov rbx, [rsp + 8]
+    or rax, PAGE_PRESENT | PAGE_WRITABLE
+    mov [rbx + r14*8], rax
+.pd:
+    mov rax, [rbx + r14*8]
+    test al, PAGE_SIZE_FLAG
+    jnz .conflict
+    MASK_FRAME rax
+    mov rbx, rax
+
+    mov rax, r12
+    shr rax, 21
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+    mov rax, [rbx + r14*8]
+    test al, PAGE_PRESENT
+    jnz .pt
+    mov [rsp + 8], rbx
+    call pmm_alloc_page
+    test rax, rax
+    jz .oom
+    mov rcx, rax
+    call zero_page
+    mov rbx, [rsp + 8]
+    or rax, PAGE_PRESENT | PAGE_WRITABLE
+    mov [rbx + r14*8], rax
+.pt:
+    mov rax, [rbx + r14*8]
+    test al, PAGE_SIZE_FLAG
+    jnz .split_needed
+    MASK_FRAME rax
+    mov rbx, rax
+    jmp .install
+
+.split_needed:
+    ; HHDM virtual space should never collide with the identity 2 MiB map.
+    ; Refuse the conflict rather than silently splitting a foreign mapping.
+    jmp .conflict
+
+.install:
+    mov rax, r12
+    shr rax, 12
+    and eax, PT_INDEX_BITS
+    mov r14, rax
+    mov rax, r13
+    and rax, -PAGE_SIZE
+    or rax, r15
+    or rax, PAGE_PRESENT
+    mov [rbx + r14*8], rax
+    invlpg [r12]
+    xor eax, eax
+    jmp .done
+.conflict:
+    mov eax, 1
+    jmp .done
+.oom:
+    mov eax, 2
+.done:
+    add rsp, 24
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop rbx
+    ret
+
+; Map an exact EFI memory descriptor into the HHDM.  Large-page mappings
+; are used only for the fully aligned interior of the descriptor.  The
+; leading/trailing fragments stay 4 KiB mapped, so reserved physical pages
+; immediately adjacent to RAM are never accidentally exposed by rounding.
+hh_map_region:
     push rbx
     push r12
     push r13
     push r14
     push r15
-    push rsi
-    push rdi
+
+    mov r12, rcx                ; PML4 physical
+    mov r13, rdx                ; physical start
+    mov r14, r8                 ; physical end (exclusive)
+    mov r15, r9                 ; flags
+
+    cmp r13, r14
+    jae .ok
+
+    ; Leading partial 2 MiB region.
+    mov rax, r13
+    mov rdx, r13
+    add rdx, VMM_2MB_PAGE_SIZE - 1
+    and rdx, -VMM_2MB_PAGE_SIZE
+    cmp rdx, r14
+    ja .small_region
+    cmp r13, rdx
+    jae .interior
+
+.leading:
+    cmp r13, rdx
+    jae .interior
+    mov rcx, [phys_map_base_val]
+    add rcx, r13
+    mov r8, r13
+    mov r9, r15
+    call vmm_map_4k_pml4
+    test eax, eax
+    jnz .fail
+    add r13, PAGE_SIZE
+    jmp .leading
+
+.interior:
+    ; Fully aligned 2 MiB interior.
+    mov rax, r14
+    and rax, -VMM_2MB_PAGE_SIZE
+    mov rbx, rax
+
+.huge_loop:
+    cmp r13, rbx
+    jae .trailing
+    mov rcx, r12
+    mov rdx, [phys_map_base_val]
+    add rdx, r13
+    mov r8, r13
+    mov r9, r15
+    call vmm_map_2mb_pml4
+    test eax, eax
+    jnz .fail
+    add r13, VMM_2MB_PAGE_SIZE
+    jmp .huge_loop
+
+.trailing:
+    cmp r13, r14
+    jae .ok
+
+.trailing_loop:
+    mov rcx, [phys_map_base_val]
+    add rcx, r13
+    mov r8, r13
+    mov r9, r15
+    call vmm_map_4k_pml4
+    test eax, eax
+    jnz .fail
+    add r13, PAGE_SIZE
+    cmp r13, r14
+    jb .trailing_loop
+    jmp .ok
+
+.small_region:
+    mov r13, rax
+.small_loop:
+    cmp r13, r14
+    jae .ok
+    mov rcx, [phys_map_base_val]
+    add rcx, r13
+    mov r8, r13
+    mov r9, r15
+    call vmm_map_4k_pml4
+    test eax, eax
+    jnz .fail
+    add r13, PAGE_SIZE
+    jmp .small_loop
+
+.ok:
+    xor eax, eax
+    jmp .done
+.fail:
+    mov eax, 1
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+hh_init:
+    ; Build the HHDM in a bounded, deterministic way.
+    ; The old implementation walked every EFI descriptor and mixed 4 KiB
+    ; edge mappings with the 2 MiB mapper. That made the firmware->kernel
+    ; transition fragile. The kernel only needs a valid direct-map window
+    ; at this stage; the complete EFI-region policy can be layered on later.
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
 
     cmp byte [hh_active], 1
     je .ok
 
-    ; Allocate new PML4
+    ; 1 GiB initial HHDM window.
+    mov rax, 0x40000000
+    mov [hh_direct_map_limit_val], rax
+
+    ; Allocate a fresh PML4.
     call pmm_alloc_page
     test rax, rax
     jz .fail
 
     mov r12, rax
-    mov rcx, rax
+    mov rcx, r12
     call zero_page
 
-    ; Copy current PML4
+    ; Preserve the currently working kernel mappings.
     mov rsi, [pml4_ptr]
     test rsi, rsi
     jnz .copy_pml4
@@ -5980,143 +6294,46 @@ hh_init:
     and rsi, -4096
 
 .copy_pml4:
-    cld
     mov rdi, r12
     mov rcx, 512
     rep movsq
 
     mov [hh_pml4_phys], r12
 
-    ; Map usable physical memory into higher-half direct map
-    mov rsi, [boot_info + BootInfo.mem_map]
-    test rsi, rsi
-    jz .map_buddy_pool
+    ; Map physical 0..1 GiB at PHYS_MAP_BASE using 2 MiB pages.
+    ; All addresses are aligned, so no 4 KiB fragment path is involved.
+    xor r13, r13
 
-    mov r15, [boot_info + BootInfo.mem_size]
-    test r15, r15
-    jz .map_buddy_pool
-
-    mov rbx, [boot_info + BootInfo.mem_desc_size]
-    test rbx, rbx
-    jz .map_buddy_pool
-
-.map_scan:
-    cmp r15, rbx
-    jb .map_buddy_pool
-
-    mov eax, [rsi]
-
-    cmp eax, MEM_TYPE_CONVENTIONAL
-    je .map_this
-
-    cmp eax, MEM_TYPE_LOADER_DATA
-    je .map_this
-
-    cmp eax, MEM_TYPE_BS_DATA
-    je .map_this
-
-    cmp eax, MEM_TYPE_BS_CODE
-    je .map_this
-
-    cmp eax, MEM_TYPE_LOADER_CODE
-    je .map_this
-
-    jmp .next_desc
-
-.map_this:
-    mov r13, [rsi + 8]
-    mov rdx, [rsi + 24]
-
-    test rdx, rdx
-    jz .next_desc
-
-    shl rdx, PAGE_SHIFT
-
-    mov r14, r13
-    add r14, rdx
-
-    and r13, -VMM_2MB_PAGE_SIZE
-
-    add r14, VMM_2MB_PAGE_SIZE - 1
-    and r14, -VMM_2MB_PAGE_SIZE
-
-    cmp r13, [hh_direct_map_limit_val]
-    jae .next_desc
-
-    cmp r14, [hh_direct_map_limit_val]
-    jbe .cap_ok
-
-    mov r14, [hh_direct_map_limit_val]
-
-.cap_ok:
-    cmp r13, r14
-    jae .next_desc
-
-.map_region:
-    cmp r13, r14
-    jae .next_desc
+.map_loop:
+    cmp r13, 0x40000000
+    jae .validate
 
     mov rcx, r12
-
     mov rdx, [phys_map_base_val]
     add rdx, r13
-
     mov r8, r13
-    mov r9, PAGE_WRITABLE
+    mov r9, HH_MAP_FLAGS
+
     call vmm_map_2mb_pml4
+    test eax, eax
+    jnz .fail
 
-    test rax, rax
-    jz .map_next
-
-    cmp rax, 2
-    je .fail
-
-.map_next:
     add r13, VMM_2MB_PAGE_SIZE
-    jmp .map_region
+    jmp .map_loop
 
-.next_desc:
-    add rsi, rbx
-    sub r15, rbx
-    jmp .map_scan
-
-.map_buddy_pool:
-    mov rax, [buddy_pmm_pool_phys]
-    test rax, rax
-    jz .ok
-
-    cmp rax, [hh_direct_map_limit_val]
-    jae .ok
-
-    mov r13, rax
-
-    mov rcx, r12
-
-    mov rdx, [phys_map_base_val]
-    add rdx, r13
-
-    mov r8, r13
-    mov r9, PAGE_WRITABLE
-    call vmm_map_2mb_pml4
+.validate:
+    ; Do not mark HHDM active here. CR3 activation is responsible for that.
+    xor eax, eax
+    jmp .done
 
 .ok:
-    mov byte [hh_active], 1
     xor eax, eax
-
-    pop rdi
-    pop rsi
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    ret
+    jmp .done
 
 .fail:
     mov eax, 1
 
-    pop rdi
-    pop rsi
+.done:
     pop r15
     pop r14
     pop r13
@@ -6129,6 +6346,7 @@ hh_activate:
     test rax, rax
     jz .done
 
+    and rax, -4096
     mov cr3, rax
 
 .done:
@@ -6756,6 +6974,8 @@ boot_exit:
     FAIL_CODE 'Z'
 
 .success:
+    ; From this point onward the kernel must never call UEFI Boot Services.
+    mov byte [exit_boot_services_done], 1
     cli
 
     mov rsp, r12
@@ -6856,8 +7076,8 @@ mmapi_test:
     cmp byte [r12 + PAGE_SIZE - 1], 0
     jne .fail_free
 
-    mov qword [r12], 0xDEADBEEF
-    cmp qword [r12], 0xDEADBEEF
+    mov dword [r12], 0xDEADBEEF
+    cmp dword [r12], 0xDEADBEEF
     jne .fail_free
 
     mov rcx, r12
@@ -7096,6 +7316,16 @@ cmd_execute:
     call cmd_is
     test eax, eax
     jnz .vmmtest
+
+    lea rsi, [str_cmd_pmmstress]
+    call cmd_is
+    test eax, eax
+    jnz .pmmstress
+
+    lea rsi, [str_cmd_vmmstress]
+    call cmd_is
+    test eax, eax
+    jnz .vmmstress
 
     lea rsi, [str_cmd_highmap]
     call cmd_is
@@ -7414,6 +7644,14 @@ cmd_execute:
     call draw_text
     ret
 
+.pmmstress:
+    call pmm_stress_test
+    ret
+
+.vmmstress:
+    call vmm_stress_test
+    ret
+
 .highmap:
     call vmm_map_high
     test eax, eax
@@ -7514,15 +7752,28 @@ cmd_execute:
     ret
 
 .exit:
+    cmp byte [kernel_mode], 1
+    je .exit_kernel
     jmp exit_boot_services_sequence
+
+.exit_kernel:
+    lea r9, [msg_exit_unavailable]
+    call draw_text
+    ret
 
 .done:
     ret
 
 exit_boot_services_sequence:
+    ; Everything that touches UEFI state is completed before the one-way
+    ; transition.  In particular, do NOT call draw_text/console/UEFI after
+    ; ExitBootServices succeeds.
     call cursor_erase
 
     lea r9, [msg_exitbs]
+    call draw_text
+
+    lea r9, [msg_exitbs_transfer]
     call draw_text
 
     lea rsi, [s_exitbs]
@@ -7530,26 +7781,118 @@ exit_boot_services_sequence:
 
     call exit_boot_services
 
-    call kernel_entry
+    ; ExitBootServices may reclaim the firmware-owned stack.  Do NOT execute
+    ; any CALL/PUSH/POP on that stack after the successful transition.
+    ; Switch to our kernel-owned stack immediately, before even emitting the
+    ; first post-ExitBootServices debug marker.
+    lea rsp, [kernel_stack_top]
+    and rsp, -16
 
-.halt:
+    ; From this instruction onward we are native kernel code.
+    mov byte [kernel_mode], 1
+    mov byte [kernel_stage], 1
+    mov al, 'K'
+    call debug_stage
+    jmp kernel_entry
+
+.kernel_transfer_unreachable:
     cli
     hlt
-    jmp .halt
+    jmp .kernel_transfer_unreachable
 
 kernel_entry:
     cli
 
-    call gdt_init
-    call tss_init
-    call idt_init_full
+    ; Do not touch the firmware console here.  The first kernel instructions
+    ; use only our own stack, serial/debug I/O and the already-built identity
+    ; mappings.
+    mov byte [kernel_stage], 2
+    mov al, 'G'
+    call debug_stage
 
     lea rsp, [kernel_stack_top]
+    and rsp, -16
 
+    lea rsi, [s_kern_gdt]
+    call serial_puts
+    call gdt_init
+
+    mov byte [kernel_stage], 3
+    mov al, 'T'
+    call debug_stage
+    lea rsi, [s_kern_tss]
+    call serial_puts
+    call tss_init
+
+    mov byte [kernel_stage], 4
+    mov al, 'I'
+    call debug_stage
+    lea rsi, [s_kern_idt]
+    call serial_puts
+    call idt_init_full
+
+    mov byte [kernel_stage], 5
+    mov al, 'V'
+    call debug_stage
+    lea rsi, [s_kern_vmm]
+    call serial_puts
     call vmm_activate
     mov byte [vmm_active], 1
 
+    ; Build a new kernel PML4 by copying the known-good identity map and
+    ; adding the RAM direct map.  Never continue silently if construction
+    ; fails.
+    mov byte [kernel_stage], 6
+    mov al, 'H'
+    call debug_stage
+    lea rsi, [s_kern_hh_init]
+    call serial_puts
+    call hh_init
+    test eax, eax
+    jnz .hh_fail
+
+    lea rsi, [s_kern_hh_ready]
+    call serial_puts
+
+    mov byte [kernel_stage], 7
+    mov al, 'C'
+    call debug_stage
+    lea rsi, [s_kern_hh_cr3]
+    call serial_puts
+    call hh_activate
+
+    mov rax, [hh_pml4_phys]
+    test rax, rax
+    jz .hh_fail
+    mov rcx, cr3
+    and rcx, -4096
+    cmp rcx, rax
+    jne .hh_fail
+
+    mov [pml4_ptr], rax
+    mov byte [vmm_active], 1
+    mov byte [hh_active], 1
+    mov byte [kernel_stage], 8
+    mov al, 'h'
+    call debug_stage
+
+    lea rsi, [s_kern_console]
+    call serial_puts
     call console_clear
+
+    jmp .kernel_console_ready
+
+.hh_fail:
+    mov al, '!'
+    call debug_stage
+    lea rsi, [s_kern_hh_fail]
+    call serial_puts
+    cli
+.hh_halt:
+    hlt
+    jmp .hh_halt
+
+.kernel_console_ready:
 
     ; Start the kernel shell with a clean command state.
     mov qword [cmd_len], 0
@@ -7560,6 +7903,30 @@ kernel_entry:
 
     lea r9, [msg_kernel_banner]
     call draw_text
+
+    ; The boot self-tests are intentionally shown BEFORE the READY line.
+    ; This keeps the kernel startup screen in chronological order.
+    lea r9, [msg_kernel_init]
+    call draw_text
+
+    mov byte [kernel_selftest_failures], 0
+
+    call kernel_core_selftest
+    call kernel_arch_selftest
+    call pmm_stress_test
+    call vmm_stress_test
+
+    cmp byte [kernel_selftest_failures], 0
+    jne .kernel_degraded
+    lea r9, [msg_kernel_ready]
+    call draw_text
+    jmp .kernel_ready_done
+
+.kernel_degraded:
+    lea r9, [msg_kernel_degraded]
+    call draw_text
+
+.kernel_ready_done:
 
     call cursor_draw
     mov dword [blink_counter], 0
@@ -7585,6 +7952,461 @@ kernel_entry:
     mov dword [blink_counter], 0
     call cursor_toggle
     jmp .kernel_loop
+
+;================ CORE ARCHITECTURE SELFTEST =================
+
+; Validate the five milestones that form the firmware -> native-kernel
+; boundary. Every green line below is backed by a concrete runtime check.
+kernel_core_selftest:
+    push rbx
+    push r12
+
+    ; 1) UEFI HAL / BootInfo contract.
+    cmp byte [hal_uefi_ready], 1
+    jne .hal_fail
+    cmp qword [boot_info + BootInfo.fb], 0
+    je .hal_fail
+    cmp qword [boot_info + BootInfo.mem_map], 0
+    je .hal_fail
+    lea r9, [msg_hal_ok]
+    call draw_text
+    jmp .memory_check
+.hal_fail:
+    inc byte [kernel_selftest_failures]
+    lea r9, [msg_hal_fail]
+    call draw_text
+
+.memory_check:
+    ; 2) Unified memory manager: PMM metadata must be live and VMM active.
+    cmp byte [memory_manager_ready], 1
+    jne .mm_fail
+    cmp byte [vmm_active], 1
+    jne .mm_fail
+    cmp qword [boot_info + BootInfo.pmm_free_pages], 0
+    je .mm_fail
+    lea r9, [msg_mm_ok]
+    call draw_text
+    jmp .hhdm_check
+.mm_fail:
+    inc byte [kernel_selftest_failures]
+    lea r9, [msg_mm_fail]
+    call draw_text
+
+.hhdm_check:
+    ; 3) Higher-half direct map must have its own PML4 and active flag.
+    cmp byte [hh_active], 1
+    jne .hhdm_fail
+    cmp qword [hh_pml4_phys], 0
+    je .hhdm_fail
+    cmp qword [phys_map_base_val], 0
+    je .hhdm_fail
+
+    ; Verify a real allocated RAM frame through the active direct map. This
+    ; avoids treating an unmapped physical hole at address 0 as a failure.
+    call pmm_alloc_page
+    test rax, rax
+    jz .hhdm_fail_free_none
+    mov r12, rax
+
+    mov rcx, r12
+    call phys_to_virt
+    mov rbx, rax
+
+    mov rcx, rbx
+    call vmm_translate
+    test rax, rax
+    jz .hhdm_fail_free
+    cmp rax, r12
+    jne .hhdm_fail_free
+
+    mov rcx, r12
+    call pmm_free_page
+
+    mov byte [hh_verified], 1
+    lea r9, [msg_hhdm_ok]
+    call draw_text
+    jmp .exitbs_check
+
+.hhdm_fail_free:
+    mov rcx, r12
+    call pmm_free_page
+.hhdm_fail_free_none:
+.hhdm_fail:
+    inc byte [kernel_selftest_failures]
+    lea r9, [msg_hhdm_fail]
+    call draw_text
+
+.exitbs_check:
+    ; 4) ExitBootServices is a one-way state transition. The flag is set
+    ; only by the canonical exit_boot_services success path.
+    cmp byte [exit_boot_services_done], 1
+    jne .exitbs_fail
+    lea r9, [msg_exitbs_state_ok]
+    call draw_text
+    jmp .done
+.exitbs_fail:
+    inc byte [kernel_selftest_failures]
+    lea r9, [msg_exitbs_state_fail]
+    call draw_text
+
+.done:
+    pop r12
+    pop rbx
+    ret
+
+;================ KERNEL FOUNDATION SELFTEST =================
+
+kernel_arch_selftest:
+    push rbx
+    push r12
+    sub rsp, 8
+
+    ; Check the GDT loaded by the CPU.
+    sgdt [selftest_gdtr]
+    movzx eax, word [selftest_gdtr]
+    cmp eax, 0x2F
+    jb .fail
+    mov rax, [selftest_gdtr + 2]
+    lea rbx, [gdt]
+    cmp rax, rbx
+    jne .fail
+
+    ; Check current code segment.
+    xor eax, eax
+    mov ax, cs
+    cmp ax, 0x08
+    jne .fail
+
+    ; Check TSS is loaded with our TSS selector.
+    str ax
+    cmp ax, 0x28
+    jne .fail
+
+    ; Verify the TSS descriptor resolves to our actual TSS object.
+    mov rax, [gdt + 0x28]
+    mov rdx, rax
+    shr rdx, 16
+    and edx, 0xFFFFFF
+    mov rcx, rax
+    shr rcx, 56
+    shl rcx, 24
+    or rdx, rcx
+    mov rcx, [gdt + 0x30]
+    and rcx, 0xFFFFFFFF
+    shl rcx, 32
+    or rdx, rcx
+    lea rbx, [tss]
+    cmp rdx, rbx
+    jne .fail
+
+    ; Check IDT is installed, points at our table, and has live handlers for
+    ; the architecturally critical vectors.
+    sidt [selftest_idtr]
+    movzx eax, word [selftest_idtr]
+    cmp eax, (256 * 16) - 1
+    jne .fail
+    mov rax, [selftest_idtr + 2]
+    lea rbx, [idt]
+    cmp rax, rbx
+    jne .fail
+
+    movzx eax, word [idt + 14*16]
+    test eax, eax
+    jz .fail
+    movzx eax, word [idt + 8*16]
+    test eax, eax
+    jz .fail
+    movzx eax, word [idt + 2*16]
+    test eax, eax
+    jz .fail
+
+    ; Check CR3 and VMM state.
+    mov rax, cr3
+    and rax, -4096
+    test rax, rax
+    jz .fail
+    cmp byte [vmm_active], 1
+    jne .fail
+    cmp qword [hh_pml4_phys], 0
+    je .fail
+    cmp rax, [hh_pml4_phys]
+    jne .fail
+
+    lea r9, [msg_arch_ok]
+    call draw_text
+    jmp .done
+
+.fail:
+    inc byte [kernel_selftest_failures]
+    lea r9, [msg_arch_fail]
+    call draw_text
+
+.done:
+    add rsp, 8
+    pop r12
+    pop rbx
+    ret
+
+;================ PMM STRESS TEST =================
+
+pmm_stress_test:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    xor r12d, r12d                 ; allocated count
+    xor r13d, r13d                 ; index
+
+.alloc_loop:
+    cmp r13d, PMM_STRESS_COUNT
+    jae .verify
+
+    call pmm_alloc_page
+    test rax, rax
+    jz .fail
+
+    mov [pmm_stress_ptrs + r13*8], rax
+    mov r14, rax
+    mov r15, r13
+    shl r15, 32
+    mov eax, 0x54524553             ; low 32-bit deterministic marker
+    or r15, rax
+    mov [r14], r15
+
+    inc r13
+    inc r12
+    jmp .alloc_loop
+
+.verify:
+    xor r13d, r13d
+
+.verify_loop:
+    cmp r13d, PMM_STRESS_COUNT
+    jae .free_all
+
+    mov r14, [pmm_stress_ptrs + r13*8]
+    test r14, r14
+    jz .fail
+
+    mov r15, r13
+    shl r15, 32
+    mov eax, 0x54524553
+    or r15, rax
+    cmp [r14], r15
+    jne .fail
+
+    inc r13
+    jmp .verify_loop
+
+.free_all:
+    xor r13d, r13d
+
+.free_loop:
+    cmp r13d, PMM_STRESS_COUNT
+    jae .pass
+
+    mov rcx, [pmm_stress_ptrs + r13*8]
+    test rcx, rcx
+    jz .next_free
+    call pmm_free_page
+    mov qword [pmm_stress_ptrs + r13*8], 0
+
+.next_free:
+    inc r13
+    jmp .free_loop
+
+.fail:
+    ; Release everything allocated so far. This path is deliberately conservative.
+    xor r13d, r13d
+.cleanup_loop:
+    cmp r13d, PMM_STRESS_COUNT
+    jae .report_fail
+    mov rcx, [pmm_stress_ptrs + r13*8]
+    test rcx, rcx
+    jz .cleanup_next
+    call pmm_free_page
+    mov qword [pmm_stress_ptrs + r13*8], 0
+.cleanup_next:
+    inc r13
+    jmp .cleanup_loop
+
+.report_fail:
+    inc byte [kernel_selftest_failures]
+    lea r9, [msg_pmm_stress_fail]
+    call draw_text
+    jmp .done
+
+.pass:
+    lea r9, [msg_pmm_stress_ok]
+    call draw_text
+
+.done:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+;================ VMM STRESS TEST =================
+
+vmm_stress_test:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    cmp byte [vmm_active], 1
+    jne .inactive
+
+    xor r13d, r13d
+
+.map_loop:
+    cmp r13d, VMM_STRESS_COUNT
+    jae .verify
+
+    call pmm_alloc_page
+    test rax, rax
+    jz .fail_cleanup
+
+    mov [vmm_stress_ptrs + r13*8], rax
+    mov r14, rax
+    mov rcx, rax
+    call zero_page
+
+    mov rcx, VMM_STRESS_BASE
+    mov rax, r13
+    shl rax, PAGE_SHIFT
+    add rcx, rax
+    mov rdx, r14
+    mov r8, PAGE_WRITABLE
+    call vmm_map_4k
+    test eax, eax
+    jnz .fail_cleanup
+
+    mov rcx, VMM_STRESS_BASE
+    mov rax, r13
+    shl rax, PAGE_SHIFT
+    add rcx, rax
+    mov rax, r13
+    shl rax, 32
+    mov edx, 0x54524553
+    or rax, rdx
+    mov [rcx], rax
+
+    inc r13
+    jmp .map_loop
+
+.verify:
+    xor r13d, r13d
+
+.verify_loop:
+    cmp r13d, VMM_STRESS_COUNT
+    jae .unmap
+
+    mov rcx, VMM_STRESS_BASE
+    mov rax, r13
+    shl rax, PAGE_SHIFT
+    add rcx, rax
+    mov r14, r13
+    shl r14, 32
+    mov eax, 0x54524553
+    or r14, rax
+    cmp [rcx], r14
+    jne .fail_cleanup
+
+    mov rcx, VMM_STRESS_BASE
+    mov rax, r13
+    shl rax, PAGE_SHIFT
+    add rcx, rax
+    call vmm_translate
+    test rax, rax
+    jz .fail_cleanup
+
+    inc r13
+    jmp .verify_loop
+
+.unmap:
+    xor r13d, r13d
+
+.unmap_loop:
+    cmp r13d, VMM_STRESS_COUNT
+    jae .pass
+
+    mov rcx, VMM_STRESS_BASE
+    mov rax, r13
+    shl rax, PAGE_SHIFT
+    add rcx, rax
+    call vmm_unmap_4k
+
+    mov rcx, [vmm_stress_ptrs + r13*8]
+    call pmm_free_page
+    mov qword [vmm_stress_ptrs + r13*8], 0
+
+    inc r13
+    jmp .unmap_loop
+
+.fail_cleanup:
+    xor r13d, r13d
+.cleanup_loop:
+    cmp r13d, VMM_STRESS_COUNT
+    jae .report_fail
+
+    mov rcx, VMM_STRESS_BASE
+    mov rax, r13
+    shl rax, PAGE_SHIFT
+    add rcx, rax
+    call vmm_unmap_4k
+
+    mov rcx, [vmm_stress_ptrs + r13*8]
+    test rcx, rcx
+    jz .cleanup_next
+    call pmm_free_page
+    mov qword [vmm_stress_ptrs + r13*8], 0
+.cleanup_next:
+    inc r13
+    jmp .cleanup_loop
+
+.report_fail:
+    inc byte [kernel_selftest_failures]
+    lea r9, [msg_vmm_stress_fail]
+    call draw_text
+    jmp .done
+
+.pass:
+    lea r9, [msg_vmm_stress_ok]
+    call draw_text
+    jmp .done
+
+.inactive:
+    lea r9, [msg_vmm_stress_inactive]
+
+.done:
+    cmp byte [vmm_active], 1
+    jne .print_inactive
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.print_inactive:
+    call draw_text
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 exit_boot_services:
     push rbx
@@ -7628,6 +8450,9 @@ exit_boot_services:
     FAIL_CODE 'Z'
 
 .success:
+    ; ExitBootServices succeeded. This is the canonical state transition.
+    ; The kernel self-test consumes this flag after control reaches kernel_entry.
+    mov byte [exit_boot_services_done], 1
     cli
 
     mov rsp, r12
@@ -7779,6 +8604,26 @@ blink_counter:
 vmm_active:
     db 0
 
+kernel_selftest_failures:
+    db 0
+
+;================ CORE ARCHITECTURE STATE ===================
+; These flags describe the hand-off from firmware to the native kernel.
+hal_uefi_ready:
+    db 0
+
+memory_manager_ready:
+    db 0
+
+exit_boot_services_done:
+    db 0
+
+kernel_mode:
+kernel_stage:
+    db 0
+
+    db 0
+
 vmm_supported:
     db 1
 
@@ -7865,6 +8710,64 @@ msg_vmm_skip:
 msg_idt_ok:
     db "IDT: installed",10,0
 
+msg_hal_ok:
+    db "  [ OK ] UEFI HAL / BootInfo",10,0
+
+msg_hal_fail:
+    db "  [FAIL] UEFI HAL / BootInfo",10,0
+
+msg_mm_ok:
+    db "  [ OK ] Unified Memory Manager",10,0
+
+msg_mm_fail:
+    db "  [FAIL] Unified Memory Manager",10,0
+
+msg_hhdm_ok:
+    db "  [ OK ] Higher-Half / Direct Map active",10,0
+
+msg_hhdm_fail:
+    db "  [FAIL] Higher-Half / Direct Map",10,0
+
+msg_exitbs_state_ok:
+    db "  [ OK ] ExitBootServices boundary",10,0
+
+msg_exitbs_state_fail:
+    db "  [FAIL] ExitBootServices boundary",10,0
+
+msg_arch_ok:
+    db "  [ OK ] GDT / IDT / TSS / CR3",10,0
+
+msg_arch_fail:
+    db "  [FAIL] GDT / IDT / TSS / CR3",10,0
+
+msg_pmm_stress_ok:
+    db "  [ OK ] PMM : 32-page allocation / verify / free",10,0
+
+msg_pmm_stress_fail:
+    db "  [FAIL] PMM : stress test",10,0
+
+msg_vmm_stress_ok:
+    db "  [ OK ] VMM : 16 mappings / verify / unmap",10,0
+
+msg_vmm_stress_fail:
+    db "  [FAIL] VMM : stress test",10,0
+
+msg_vmm_stress_inactive:
+    db "  [SKIP] VMM : inactive",10,0
+
+msg_kernel_init:
+    db 10,"---------------- KERNEL INITIALIZING ----------------",10,0
+
+msg_kernel_ready:
+    db 10,"---------------- KERNEL READY ----------------",10,0
+
+msg_kernel_degraded:
+    db 10,"------------ KERNEL READY (DEGRADED) ---------",10
+    db "One or more boot self-tests failed.",10,0
+
+msg_exit_unavailable:
+    db "exit: unavailable after Boot Services termination",10,0
+
 msg_shell_hint:
     db "Type 'help' for commands.",10,0
 
@@ -7872,7 +8775,28 @@ msg_exitbs:
     db "Exiting Boot Services...",10,0
 
 msg_exitbs_ok:
-    db "Boot services exited. System halted.",10,0
+    db "[ OK ] UEFI Boot Services terminated",10,0
+msg_exitbs_transfer:
+    db "[ OK ] Transferring control to kernel...",10,0
+
+s_kern_gdt:
+    db "[KERN] gdt_init",10,0
+s_kern_tss:
+    db "[KERN] tss_init",10,0
+s_kern_idt:
+    db "[KERN] idt_init",10,0
+s_kern_vmm:
+    db "[KERN] vmm_activate",10,0
+s_kern_hh_init:
+    db "[KERN] hh_init",10,0
+s_kern_hh_cr3:
+    db "[KERN] hh_activate/cr3",10,0
+s_kern_hh_ready:
+    db "[KERN] higher-half RAM map built",10,0
+s_kern_hh_fail:
+    db "[KERN PANIC] higher-half address-space activation failed",10,0
+s_kern_console:
+    db "[KERN] console",10,0
 
 msg_serial_sent:
     db "Serial: test message sent.",10,0
@@ -7928,6 +8852,12 @@ str_cmd_pmmtest:
 str_cmd_vmmtest:
     db "vmmtest",0
 
+str_cmd_pmmstress:
+    db "pmmstress",0
+
+str_cmd_vmmstress:
+    db "vmmstress",0
+
 str_cmd_exit:
     db "exit",0
 
@@ -7942,6 +8872,8 @@ msg_help:
     db "  test        - run all tests",10
     db "  pmmtest     - test PMM allocator",10
     db "  vmmtest     - test VMM mapping",10
+    db "  pmmstress   - stress-test physical memory",10
+    db "  vmmstress   - stress-test virtual memory",10
     db "  highmap     - map physical memory to higher-half",10
     db "  heap        - initialize/show kernel heap",10
     db "  heaptest    - test kernel heap",10
@@ -8027,6 +8959,9 @@ s_idt_ok:
 s_exitbs:
     db "Exiting Boot Services",13,10,0
 
+s_exitbs_ok:
+    db "ExitBootServices: success",13,10,0
+
 hex_digits:
     db "0123456789ABCDEF"
 
@@ -8038,6 +8973,9 @@ str_vector:
 
 str_error:
     db 10,"Error : 0x",0
+
+str_cr2:
+    db "CR2       : 0x",0
 
 str_rip:
     db 10,"RIP   : 0x",0
@@ -8257,6 +9195,8 @@ msg_slabtest_fail:
 
 hh_active:
     db 0
+hh_verified:
+    db 0
 
 hh_pml4_phys:
     dq 0
@@ -8346,15 +9286,8 @@ msg_kernel_banner:
     db "===============================================================",10
     db "                     0xDEAD OPERATING SYSTEM",10
     db "                         KERNEL MODE",10,10
-    db "  [ OK ] UEFI Boot Services terminated",10
-    db "  [ OK ] GDT initialized",10
-    db "  [ OK ] TSS initialized",10
-    db "  [ OK ] IDT initialized",10
-    db "  [ OK ] Virtual Memory activated",10
-    db "  [ OK ] Kernel stack initialized",10,10
     db "---------------------------------------------------------------",10,10
-    db "                       KERNEL READY",10,10
-    db "                     0xDEAD kernel> ",0
+    db "                    KERNEL INITIALIZING",10,10,0
 
 font_table:
     db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
@@ -8530,6 +9463,23 @@ new_idtr_limit:
     dw (256 * 16) - 1
 new_idtr_base:
     dq 0
+
+align 16
+selftest_idtr:
+    dw 0
+    dq 0
+
+selftest_gdtr:
+    dw 0
+    dq 0
+
+align 8
+pmm_stress_ptrs:
+    times PMM_STRESS_COUNT dq 0
+
+align 8
+vmm_stress_ptrs:
+    times VMM_STRESS_COUNT dq 0
 
 old_idtr_limit:
     dw 0
