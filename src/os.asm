@@ -181,6 +181,31 @@ global _e
 %define CTX_RFLAGS   56
 %define CTX_SIZE     64
 %define THREAD_STACK_SIZE 4096
+%define THREAD_STATE_FREE     0
+%define THREAD_STATE_READY    1
+%define THREAD_STATE_RUNNING  2
+%define THREAD_STATE_DEAD     3
+%define THREAD_STATE_BLOCKED  4
+%define THREAD_FLAG_STATIC   (1 << 0)
+%define THREAD_MAGIC          0x5448524454485244
+%define THREAD_CANARY         0xC0FFEEDEADBEEF42
+%define TH_ID                 0
+%define TH_STATE              8
+%define TH_FLAGS              16
+%define TH_STACK_BASE         24
+%define TH_STACK_TOP          32
+%define TH_ENTRY              40
+%define TH_ARG                48
+%define TH_CTX                56
+%define TH_CANARY             120
+%define TH_MAGIC              128
+%define TH_NEXT               144
+%define TH_PREV               152
+%define TH_ALL_NEXT           160
+%define TH_ALL_PREV           168
+%define TH_SIZE               176
+%define SCHED_MAX_TEST_THREADS 3
+%define SCHED_TEST_ROUNDS 3
 %define PMM_STRESS_COUNT 32
 %define VMM_STRESS_COUNT 16
 %define VMM_STRESS_BASE 0xFFFFB00000000000
@@ -7584,6 +7609,655 @@ context_test_thread:
     hlt
     jmp .halt
 
+
+;================ THREAD / SCHEDULER =================
+; Thread descriptor layout:
+;   0   id
+;   8   state
+;   16  flags
+;   24  stack base
+;   32  stack top
+;   40  entry
+;   48  argument
+;   56  Context (64 bytes)
+;   120 descriptor canary
+;   128 magic
+;   144 ready-queue next
+;   152 ready-queue prev
+;   160 all-thread next
+;   168 all-thread prev
+;
+; Scheduler policy in this stage:
+;   - intrusive doubly-linked ready queue
+;   - intrusive all-thread list
+;   - cooperative round-robin
+;   - the current thread is RUNNING and normally not in ready queue
+;   - scheduler_yield() requeues a live current thread
+;   - scheduler_thread_exit() never returns and switches to the next ready
+;     thread, or to scheduler_return_thread when the queue becomes empty.
+
+;---------------- Ready queue primitives ----------------
+; void ready_enqueue(Thread *t) ; rdi=t, returns eax=0 success / 1 reject
+ready_enqueue:
+    test rdi, rdi
+    jz .fail
+    cmp qword [rdi + TH_MAGIC], THREAD_MAGIC
+    jne .fail
+    cmp qword [rdi + TH_STATE], THREAD_STATE_READY
+    jne .fail
+    cmp qword [rdi + TH_NEXT], 0
+    jne .fail
+    cmp qword [rdi + TH_PREV], 0
+    jne .fail
+
+    mov rax, [ready_tail]
+    test rax, rax
+    jz .empty
+    mov [rax + TH_NEXT], rdi
+    mov [rdi + TH_PREV], rax
+    mov qword [rdi + TH_NEXT], 0
+    mov [ready_tail], rdi
+    inc qword [ready_count]
+    xor eax, eax
+    ret
+.empty:
+    mov qword [rdi + TH_PREV], 0
+    mov qword [rdi + TH_NEXT], 0
+    mov [ready_head], rdi
+    mov [ready_tail], rdi
+    inc qword [ready_count]
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+; Thread *ready_dequeue(void)
+ready_dequeue:
+    mov rax, [ready_head]
+    test rax, rax
+    jz .empty
+    mov rdx, [rax + TH_NEXT]
+    test rdx, rdx
+    jz .last
+    mov qword [rdx + TH_PREV], 0
+    mov [ready_head], rdx
+    mov qword [rax + TH_NEXT], 0
+    mov qword [rax + TH_PREV], 0
+    dec qword [ready_count]
+    ret
+.last:
+    mov qword [ready_head], 0
+    mov qword [ready_tail], 0
+    mov qword [rax + TH_NEXT], 0
+    mov qword [rax + TH_PREV], 0
+    dec qword [ready_count]
+    ret
+.empty:
+    xor eax, eax
+    ret
+
+; int ready_remove(Thread *t) ; 0 removed, 1 not queued/error
+ready_remove:
+    test rdi, rdi
+    jz .fail
+    mov rax, [rdi + TH_NEXT]
+    mov rdx, [rdi + TH_PREV]
+    test rdx, rdx
+    jnz .have_prev
+    cmp qword [ready_head], rdi
+    jne .fail
+    mov [ready_head], rax
+    jmp .next
+.have_prev:
+    mov [rdx + TH_NEXT], rax
+.next:
+    test rax, rax
+    jnz .have_next
+    mov [ready_tail], rdx
+    jmp .clear
+.have_next:
+    mov [rax + TH_PREV], rdx
+.clear:
+    mov qword [rdi + TH_NEXT], 0
+    mov qword [rdi + TH_PREV], 0
+    dec qword [ready_count]
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+;---------------- All-thread list ----------------
+all_thread_add:
+    test rdi, rdi
+    jz .fail
+    mov rax, [all_thread_tail]
+    test rax, rax
+    jz .empty
+    mov [rax + TH_ALL_NEXT], rdi
+    mov [rdi + TH_ALL_PREV], rax
+    mov qword [rdi + TH_ALL_NEXT], 0
+    mov [all_thread_tail], rdi
+    inc qword [all_thread_count]
+    xor eax, eax
+    ret
+.empty:
+    mov qword [rdi + TH_ALL_PREV], 0
+    mov qword [rdi + TH_ALL_NEXT], 0
+    mov [all_thread_head], rdi
+    mov [all_thread_tail], rdi
+    inc qword [all_thread_count]
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+all_thread_remove:
+    test rdi, rdi
+    jz .fail
+    mov rax, [rdi + TH_ALL_NEXT]
+    mov rdx, [rdi + TH_ALL_PREV]
+    test rdx, rdx
+    jnz .have_prev
+    cmp qword [all_thread_head], rdi
+    jne .fail
+    mov [all_thread_head], rax
+    jmp .next
+.have_prev:
+    mov [rdx + TH_ALL_NEXT], rax
+.next:
+    test rax, rax
+    jnz .have_next
+    mov [all_thread_tail], rdx
+    jmp .clear
+.have_next:
+    mov [rax + TH_ALL_PREV], rdx
+.clear:
+    mov qword [rdi + TH_ALL_NEXT], 0
+    mov qword [rdi + TH_ALL_PREV], 0
+    dec qword [all_thread_count]
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+;---------------- Thread creation/destruction ----------------
+; Thread *thread_create(void (*entry)(void *), void *arg)
+thread_create:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+    test rdi, rdi
+    jz .fail
+    mov r13, rdi
+    mov r14, rsi
+
+    mov rcx, TH_SIZE
+    call kmalloc
+    test rax, rax
+    jz .fail
+    mov r12, rax
+
+    mov rdi, r12
+    xor eax, eax
+    mov rcx, TH_SIZE / 8
+    rep stosq
+
+    mov rax, [thread_next_id]
+    test rax, rax
+    jnz .id_ok
+    mov rax, 1
+.id_ok:
+    mov [r12 + TH_ID], rax
+    inc rax
+    mov [thread_next_id], rax
+    mov qword [r12 + TH_STATE], THREAD_STATE_READY
+    mov qword [r12 + TH_FLAGS], 0
+    mov [r12 + TH_ENTRY], r13
+    mov [r12 + TH_ARG], r14
+    mov qword [r12 + TH_CANARY], THREAD_CANARY
+    mov qword [r12 + TH_MAGIC], THREAD_MAGIC
+
+    mov rcx, THREAD_STACK_SIZE
+    call kmalloc
+    test rax, rax
+    jz .free_thread
+    mov r15, rax
+    mov [r12 + TH_STACK_BASE], r15
+    lea rbx, [r15 + THREAD_STACK_SIZE]
+    mov [r12 + TH_STACK_TOP], rbx
+    mov qword [r15], THREAD_CANARY
+
+    lea rdi, [r12 + TH_CTX]
+    mov rsi, rbx
+    lea rdx, [thread_bootstrap]
+    call context_init
+    mov [r12 + TH_CTX + CTX_R12], r12
+
+    mov rdi, r12
+    call all_thread_add
+    test eax, eax
+    jnz .free_stack
+
+    mov rdi, r12
+    call ready_enqueue
+    test eax, eax
+    jnz .remove_all
+
+    mov rax, r12
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.remove_all:
+    mov rdi, r12
+    call all_thread_remove
+.free_stack:
+    mov rcx, [r12 + TH_STACK_BASE]
+    call kfree
+.free_thread:
+    mov rcx, r12
+    call kfree
+.fail:
+    xor eax, eax
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; int thread_destroy(Thread *t)
+thread_destroy:
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+    mov r12, rdi
+    test r12, r12
+    jz .fail
+    cmp qword [r12 + TH_MAGIC], THREAD_MAGIC
+    jne .fail
+    test qword [r12 + TH_FLAGS], THREAD_FLAG_STATIC
+    jnz .fail
+    cmp qword [current_thread], r12
+    je .fail
+
+    mov rax, [r12 + TH_STATE]
+    cmp rax, THREAD_STATE_RUNNING
+    je .fail
+    cmp rax, THREAD_STATE_READY
+    je .remove_ready
+    cmp rax, THREAD_STATE_DEAD
+    je .state_ok
+    jmp .fail
+
+.remove_ready:
+    mov rdi, r12
+    call ready_remove
+    test eax, eax
+    jnz .fail
+.state_ok:
+    mov r13, [r12 + TH_STACK_BASE]
+    test r13, r13
+    jz .fail
+    cmp qword [r12 + TH_CANARY], THREAD_CANARY
+    jne .fail
+    cmp qword [r13], THREAD_CANARY
+    jne .fail
+
+    mov rdi, r12
+    call all_thread_remove
+    test eax, eax
+    jnz .fail
+
+    mov qword [r12 + TH_MAGIC], 0
+    mov qword [r12 + TH_STATE], THREAD_STATE_FREE
+    mov qword [r12 + TH_CANARY], 0
+    mov rcx, r13
+    call kfree
+    mov rcx, r12
+    call kfree
+    xor eax, eax
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.fail:
+    mov eax, 1
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+;---------------- Scheduler core ----------------
+; Thread *scheduler_pick_next(void)
+; Returns a READY thread, or scheduler_return_thread when the queue is empty.
+scheduler_pick_next:
+    call ready_dequeue
+    test rax, rax
+    jnz .found
+    mov rax, [scheduler_return_thread]
+    test rax, rax
+    jz .none
+    cmp qword [rax + TH_MAGIC], THREAD_MAGIC
+    jne .none
+.found:
+    ret
+.none:
+    xor eax, eax
+    ret
+
+; Cooperative yield. Returns in the same thread after another thread has run.
+scheduler_yield:
+    mov r12, [current_thread]
+    test r12, r12
+    jz .restore_if
+    cmp qword [r12 + TH_MAGIC], THREAD_MAGIC
+    jne .restore_if
+    cmp qword [r12 + TH_STATE], THREAD_STATE_RUNNING
+    jne .restore_if
+
+    ; The scheduler's return/main thread is not part of the worker ready queue.
+    cmp r12, [scheduler_return_thread]
+    je .pick_only
+
+    mov qword [r12 + TH_STATE], THREAD_STATE_READY
+    mov rdi, r12
+    call ready_enqueue
+    test eax, eax
+    jnz .fatal
+
+.pick_only:
+    call scheduler_pick_next
+    test rax, rax
+    jz .no_next
+    cmp rax, r12
+    je .same
+
+    mov r13, rax
+    mov qword [r13 + TH_STATE], THREAD_STATE_RUNNING
+    mov [current_thread], r13
+    lea rdi, [r12 + TH_CTX]
+    lea rsi, [r13 + TH_CTX]
+    call context_switch
+    ret
+.same:
+    mov qword [r12 + TH_STATE], THREAD_STATE_RUNNING
+    mov [current_thread], r12
+.restore_if:
+    pushfq
+    pop rax
+    or rax, 0x200
+    push rax
+    popfq
+    ret
+.no_next:
+    mov qword [r12 + TH_STATE], THREAD_STATE_RUNNING
+    mov [current_thread], r12
+    jmp .restore_if
+.fatal:
+    cli
+.halt:
+    hlt
+    jmp .halt
+
+; Current thread has returned from its entry point. Never returns.
+scheduler_thread_exit:
+    mov r12, [current_thread]
+    test r12, r12
+    jz .halt
+    mov qword [r12 + TH_STATE], THREAD_STATE_DEAD
+
+    call scheduler_pick_next
+    test rax, rax
+    jz .halt
+    mov r13, rax
+    mov qword [r13 + TH_STATE], THREAD_STATE_RUNNING
+    mov [current_thread], r13
+    lea rdi, [r12 + TH_CTX]
+    lea rsi, [r13 + TH_CTX]
+    call context_switch
+.halt:
+    cli
+    hlt
+    jmp .halt
+
+thread_bootstrap:
+    mov r12, [current_thread]
+    test r12, r12
+    jz .fault
+    cmp qword [r12 + TH_MAGIC], THREAD_MAGIC
+    jne .fault
+    mov qword [r12 + TH_STATE], THREAD_STATE_RUNNING
+    mov rdi, [r12 + TH_ARG]
+    call [r12 + TH_ENTRY]
+    jmp scheduler_thread_exit
+.fault:
+    cli
+    hlt
+    jmp .fault
+
+;---------------- Scheduler test ----------------
+; Three workers each run SCHED_TEST_ROUNDS times. The main shell context is
+; temporarily registered as scheduler_return_thread, but is never enqueued.
+scheduler_test:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    lea rdi, [scheduler_test_main]
+    call scheduler_main_init
+    mov qword [scheduler_test_total], 0
+    mov qword [scheduler_test_fail], 0
+    mov qword [scheduler_test_counts + 0], 0
+    mov qword [scheduler_test_counts + 8], 0
+    mov qword [scheduler_test_counts + 16], 0
+
+    lea rdi, [scheduler_test_worker]
+    lea rsi, [scheduler_test_args + 0]
+    call thread_create
+    test rax, rax
+    jz .fail
+    mov [scheduler_test_threads + 0], rax
+
+    lea rdi, [scheduler_test_worker]
+    lea rsi, [scheduler_test_args + 8]
+    call thread_create
+    test rax, rax
+    jz .cleanup1
+    mov [scheduler_test_threads + 8], rax
+
+    lea rdi, [scheduler_test_worker]
+    lea rsi, [scheduler_test_args + 16]
+    call thread_create
+    test rax, rax
+    jz .cleanup2
+    mov [scheduler_test_threads + 16], rax
+
+    ; Main -> first worker. Main is deliberately excluded from the queue.
+    call scheduler_start
+
+    cmp qword [scheduler_test_total], SCHED_MAX_TEST_THREADS * SCHED_TEST_ROUNDS
+    jne .cleanup3
+    cmp qword [scheduler_test_counts + 0], SCHED_TEST_ROUNDS
+    jne .cleanup3
+    cmp qword [scheduler_test_counts + 8], SCHED_TEST_ROUNDS
+    jne .cleanup3
+    cmp qword [scheduler_test_counts + 16], SCHED_TEST_ROUNDS
+    jne .cleanup3
+    cmp qword [ready_count], 0
+    jne .cleanup3
+    cmp qword [all_thread_count], SCHED_MAX_TEST_THREADS
+    jne .cleanup3
+
+    mov r12, [scheduler_test_threads + 0]
+    mov rdi, r12
+    call thread_destroy
+    test eax, eax
+    jnz .cleanup_fail
+    mov r12, [scheduler_test_threads + 8]
+    mov rdi, r12
+    call thread_destroy
+    test eax, eax
+    jnz .cleanup_fail
+    mov r12, [scheduler_test_threads + 16]
+    mov rdi, r12
+    call thread_destroy
+    test eax, eax
+    jnz .cleanup_fail
+    cmp qword [all_thread_count], 0
+    jne .cleanup_fail
+
+    lea r9, [msg_schedtest_ok]
+    call draw_text
+    xor eax, eax
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.cleanup3:
+    mov rdi, [scheduler_test_threads + 0]
+    call thread_destroy
+    mov rdi, [scheduler_test_threads + 8]
+    call thread_destroy
+    mov rdi, [scheduler_test_threads + 16]
+    call thread_destroy
+    jmp .fail
+.cleanup2:
+    mov rdi, [scheduler_test_threads + 0]
+    call thread_destroy
+    mov rdi, [scheduler_test_threads + 8]
+    call thread_destroy
+    jmp .fail
+.cleanup1:
+    mov rdi, [scheduler_test_threads + 0]
+    call thread_destroy
+.fail:
+    lea r9, [msg_schedtest_fail]
+    call draw_text
+    mov eax, 1
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.cleanup_fail:
+    jmp .fail
+
+scheduler_main_init:
+    ; rdi = static main-thread descriptor
+    mov qword [rdi + TH_ID], 0
+    mov qword [rdi + TH_STATE], THREAD_STATE_RUNNING
+    mov qword [rdi + TH_FLAGS], THREAD_FLAG_STATIC
+    mov qword [rdi + TH_STACK_BASE], 0
+    mov qword [rdi + TH_STACK_TOP], 0
+    mov qword [rdi + TH_ENTRY], 0
+    mov qword [rdi + TH_ARG], 0
+    mov qword [rdi + TH_CANARY], THREAD_CANARY
+    mov qword [rdi + TH_MAGIC], THREAD_MAGIC
+    mov qword [rdi + TH_NEXT], 0
+    mov qword [rdi + TH_PREV], 0
+    mov qword [rdi + TH_ALL_NEXT], 0
+    mov qword [rdi + TH_ALL_PREV], 0
+    mov [current_thread], rdi
+    mov [scheduler_return_thread], rdi
+    ret
+
+scheduler_start:
+    ; current_thread is the shell/main context. Pick a worker and switch to it.
+    mov r12, [current_thread]
+    call scheduler_pick_next
+    test rax, rax
+    jz .done
+    mov r13, rax
+    mov qword [r13 + TH_STATE], THREAD_STATE_RUNNING
+    mov [current_thread], r13
+    lea rdi, [r12 + TH_CTX]
+    lea rsi, [r13 + TH_CTX]
+    call context_switch
+.done:
+    ret
+
+scheduler_test_worker:
+    ; rdi points to a qword worker index: 0,1,2
+    mov r12, rdi
+    mov r13, [r12]
+    lea r14, [scheduler_test_counts]
+    lea r14, [r14 + r13 * 8]
+.loop:
+    inc qword [r14]
+    inc qword [scheduler_test_total]
+    call scheduler_yield
+    cmp qword [r14], SCHED_TEST_ROUNDS
+    jb .loop
+    ret
+
+;---------------- Compatibility lifecycle test ----------------
+thread_lifecycle_test:
+    push r12
+    push r13
+    sub rsp, 8
+    mov qword [thread_test_entered], 0
+    lea rdi, [thread_test_entry]
+    xor esi, esi
+    call thread_create
+    test rax, rax
+    jz .fail
+    mov r12, rax
+    cmp qword [r12 + TH_STATE], THREAD_STATE_READY
+    jne .destroy_a_fail
+    cmp qword [r12 + TH_MAGIC], THREAD_MAGIC
+    jne .destroy_a_fail
+    cmp qword [r12 + TH_CANARY], THREAD_CANARY
+    jne .destroy_a_fail
+    mov rdi, r12
+    call thread_destroy
+    test eax, eax
+    jnz .fail
+    lea r9, [msg_threadtest_ok]
+    call draw_text
+    xor eax, eax
+    add rsp, 8
+    pop r13
+    pop r12
+    ret
+.destroy_a_fail:
+    mov rdi, r12
+    call thread_destroy
+.fail:
+    lea r9, [msg_threadtest_fail]
+    call draw_text
+    mov eax, 1
+    add rsp, 8
+    pop r13
+    pop r12
+    ret
+
+thread_test_entry:
+    mov qword [thread_test_entered], 1
+    ret
+
 cmd_execute:
     cmp qword [cmd_len], 0
     je .done
@@ -7707,6 +8381,16 @@ cmd_execute:
     call cmd_is
     test eax, eax
     jnz .ctxtest
+
+    lea rsi, [str_cmd_threadtest]
+    call cmd_is
+    test eax, eax
+    jnz .threadtest
+
+    lea rsi, [str_cmd_schedtest]
+    call cmd_is
+    test eax, eax
+    jnz .schedtest
 
     lea rsi, [str_cmd_timer]
     call cmd_is
@@ -8070,6 +8754,14 @@ cmd_execute:
 
 .ctxtest:
     call context_switch_test
+    ret
+
+.threadtest:
+    call thread_lifecycle_test
+    ret
+
+.schedtest:
+    call scheduler_test
     ret
 
 .timer:
@@ -9637,6 +10329,8 @@ msg_help:
     db "  hhvmm       - test Higher-Half VMM",10
     db "  mmapi       - test MM API",10
     db "  ctxtest     - test cooperative context switching",10
+    db "  threadtest  - test Thread create/destroy/lifecycle",10
+    db "  schedtest    - test cooperative round-robin scheduler",10
     db "  timer       - show Local APIC timer state",10
     db "  exit        - exit boot services",10
     db 0
@@ -10002,6 +10696,12 @@ str_cmd_mmapi:
 str_cmd_ctxtest:
     db "ctxtest",0
 
+str_cmd_threadtest:
+    db "threadtest",0
+
+str_cmd_schedtest:
+    db "schedtest",0
+
 msg_mmapi_v1:
     db "MM API test",10,0
 
@@ -10010,6 +10710,14 @@ msg_mmapi_ok:
 
 msg_ctxtest_ok:
     db "Context switch: OK (fresh + resume)",10,0
+msg_threadtest_ok:
+    db "Thread test: CREATE/DESTROY/LIFECYCLE OK",10,0
+msg_threadtest_fail:
+    db "Thread test: FAIL",10,0
+msg_schedtest_ok:
+    db "Scheduler: ROUND-ROBIN OK",10,0
+msg_schedtest_fail:
+    db "Scheduler: FAIL",10,0
 msg_ctxtest_fail:
     db "Context switch: FAIL",10,0
 
@@ -10187,6 +10895,43 @@ pmm_cache:
 
 align 8
 pml4_ptr:             dq 0
+align 8
+thread_next_id:
+    dq 1
+current_thread:
+    dq 0
+ready_head:
+    dq 0
+ready_tail:
+    dq 0
+ready_count:
+    dq 0
+all_thread_head:
+    dq 0
+all_thread_tail:
+    dq 0
+all_thread_count:
+    dq 0
+scheduler_return_thread:
+    dq 0
+
+thread_test_entered:
+    dq 0
+
+scheduler_test_main:
+    times TH_SIZE db 0
+
+scheduler_test_threads:
+    times SCHED_MAX_TEST_THREADS dq 0
+scheduler_test_args:
+    dq 0, 1, 2
+scheduler_test_counts:
+    times SCHED_MAX_TEST_THREADS dq 0
+scheduler_test_total:
+    dq 0
+scheduler_test_fail:
+    dq 0
+
 align 16
 ctx_main:
     times CTX_SIZE db 0
