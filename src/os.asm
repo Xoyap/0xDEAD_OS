@@ -169,6 +169,18 @@ global _e
 %endmacro
 
 %define CMD_MAX 64
+
+;================ CONTEXT SWITCH / THREAD FOUNDATION =================
+%define CTX_RSP      0
+%define CTX_RBX      8
+%define CTX_RBP      16
+%define CTX_R12      24
+%define CTX_R13      32
+%define CTX_R14      40
+%define CTX_R15      48
+%define CTX_RFLAGS   56
+%define CTX_SIZE     64
+%define THREAD_STACK_SIZE 4096
 %define PMM_STRESS_COUNT 32
 %define VMM_STRESS_COUNT 16
 %define VMM_STRESS_BASE 0xFFFFB00000000000
@@ -725,7 +737,11 @@ fill_rect_bg:
     call fill_rect
     ret
 
-cursor_draw:
+; Cursor overlay: XOR the cursor into the framebuffer.
+; Drawing and erasing use the exact same XOR operation, so erasing
+; restores every pixel exactly without saving/restoring framebuffer data.
+; This avoids corrupting characters when the cursor blinks.
+cursor_xor_rect:
     push rbx
     push rsi
     push rdi
@@ -733,25 +749,47 @@ cursor_draw:
     push r13
     push r14
     push r15
-    sub rsp, 8
 
-    mov rax, [video + Video.cx]
-    mov [cursor_x], rax
+    cld
 
-    mov rax, [video + Video.cy]
-    mov [cursor_y], rax
+    mov r12, rcx                 ; x
+    mov r13, rdx                 ; y
+    mov r14, r8                  ; width
+    mov r15, r9                  ; height
 
-    mov rcx, [cursor_x]
-    mov rdx, [cursor_y]
-    mov r8, CHAR_W
-    mov r9, CHAR_H
-    mov r10d, CURSOR_COLOR
+    mov rax, [video + Video.fb]
+    mov rdx, [video + Video.sl]
+    imul rdx, r13
+    add rdx, r12
+    shl rdx, 2
+    add rax, rdx
+    mov rdi, rax                 ; framebuffer pointer
 
-    call fill_rect
+    mov ebx, CURSOR_COLOR
 
-    mov byte [cursor_shown], 1
+.y_loop:
+    test r15, r15
+    jz .done
 
-    add rsp, 8
+    mov rsi, r14
+.x_loop:
+    test rsi, rsi
+    jz .next_row
+
+    xor dword [rdi], ebx
+    add rdi, 4
+    dec rsi
+    jmp .x_loop
+
+.next_row:
+    mov rax, [video + Video.sl]
+    sub rax, r14
+    shl rax, 2
+    add rdi, rax
+    dec r15
+    jmp .y_loop
+
+.done:
     pop r15
     pop r14
     pop r13
@@ -761,28 +799,58 @@ cursor_draw:
     pop rbx
     ret
 
+cursor_draw:
+    cmp byte [cursor_shown], 1
+    je .done
+
+    push r12
+    push r13
+    sub rsp, 8
+
+    mov rax, [video + Video.cx]
+    mov [cursor_x], rax
+    mov r12, rax
+
+    mov rax, [video + Video.cy]
+    mov [cursor_y], rax
+    mov r13, rax
+
+    mov rcx, r12
+    mov rdx, r13
+    mov r8, CHAR_W
+    mov r9, CHAR_H
+    call cursor_xor_rect
+
+    mov byte [cursor_shown], 1
+
+    add rsp, 8
+    pop r13
+    pop r12
+.done:
+    ret
+
 cursor_erase:
     cmp byte [cursor_shown], 0
     je .done
 
-    push rcx
-    push rdx
-    push r8
-    push r9
+    push r12
+    push r13
+    sub rsp, 8
 
-    mov rcx, [cursor_x]
-    mov rdx, [cursor_y]
+    mov r12, [cursor_x]
+    mov r13, [cursor_y]
+
+    mov rcx, r12
+    mov rdx, r13
     mov r8, CHAR_W
     mov r9, CHAR_H
-    call fill_rect_bg
-
-    pop r9
-    pop r8
-    pop rdx
-    pop rcx
+    call cursor_xor_rect
 
     mov byte [cursor_shown], 0
 
+    add rsp, 8
+    pop r13
+    pop r12
 .done:
     ret
 
@@ -7394,6 +7462,128 @@ test_all:
     pop r12
     ret
 
+;================ CONTEXT SWITCH FOUNDATION =================
+
+; void context_switch(Context *old, Context *next)
+; rdi = old context, rsi = next context
+; The current RET address stays on the old stack. Loading the new RSP and
+; executing RET therefore resumes the destination context naturally.
+context_switch:
+    pushfq
+    pop rax
+    mov [rdi + CTX_RFLAGS], rax
+
+    cli
+
+    mov [rdi + CTX_RSP], rsp
+    mov [rdi + CTX_RBX], rbx
+    mov [rdi + CTX_RBP], rbp
+    mov [rdi + CTX_R12], r12
+    mov [rdi + CTX_R13], r13
+    mov [rdi + CTX_R14], r14
+    mov [rdi + CTX_R15], r15
+
+    mov rsp, [rsi + CTX_RSP]
+    mov rbx, [rsi + CTX_RBX]
+    mov rbp, [rsi + CTX_RBP]
+    mov r12, [rsi + CTX_R12]
+    mov r13, [rsi + CTX_R13]
+    mov r14, [rsi + CTX_R14]
+    mov r15, [rsi + CTX_R15]
+
+    mov rax, [rsi + CTX_RFLAGS]
+    push rax
+    popfq
+    ret
+
+; rdi = Context *, rsi = stack_top, rdx = entry
+context_init:
+    pushfq
+    pop rax
+    mov [rdi + CTX_RFLAGS], rax
+
+    xor eax, eax
+    mov [rdi + CTX_RBX], rax
+    mov [rdi + CTX_RBP], rax
+    mov [rdi + CTX_R12], rax
+    mov [rdi + CTX_R13], rax
+    mov [rdi + CTX_R14], rax
+    mov [rdi + CTX_R15], rax
+
+    mov rax, rsi
+    and rax, -16
+    sub rax, 8
+    mov [rax], rdx
+    mov [rdi + CTX_RSP], rax
+    ret
+
+context_switch_test:
+    push r12
+    push r13
+
+    mov qword [ctx_test_entered], 0
+    mov qword [ctx_test_resumed], 0
+    mov qword [ctx_test_returned], 0
+
+    lea rdi, [ctx_test]
+    lea rsi, [ctx_test_stack_top]
+    lea rdx, [context_test_thread]
+    call context_init
+
+    ; main -> fresh test context
+    lea rdi, [ctx_main]
+    lea rsi, [ctx_test]
+    call context_switch
+
+    cmp qword [ctx_test_entered], 1
+    jne .fail
+    cmp qword [ctx_test_returned], 1
+    jne .fail
+
+    ; main -> suspended test context
+    lea rdi, [ctx_main]
+    lea rsi, [ctx_test]
+    call context_switch
+
+    cmp qword [ctx_test_resumed], 1
+    jne .fail
+    cmp qword [ctx_test_returned], 2
+    jne .fail
+
+    lea r9, [msg_ctxtest_ok]
+    call draw_text
+    pop r13
+    pop r12
+    ret
+
+.fail:
+    lea r9, [msg_ctxtest_fail]
+    call draw_text
+    pop r13
+    pop r12
+    ret
+
+context_test_thread:
+    mov qword [ctx_test_entered], 1
+    mov qword [ctx_test_returned], 1
+
+    lea rdi, [ctx_test]
+    lea rsi, [ctx_main]
+    call context_switch
+
+    ; Resume point: immediately after the first context_switch call.
+    mov qword [ctx_test_resumed], 1
+    mov qword [ctx_test_returned], 2
+
+    lea rdi, [ctx_test]
+    lea rsi, [ctx_main]
+    call context_switch
+
+.halt:
+    cli
+    hlt
+    jmp .halt
+
 cmd_execute:
     cmp qword [cmd_len], 0
     je .done
@@ -7512,6 +7702,11 @@ cmd_execute:
     call cmd_is
     test eax, eax
     jnz .mmapi
+
+    lea rsi, [str_cmd_ctxtest]
+    call cmd_is
+    test eax, eax
+    jnz .ctxtest
 
     lea rsi, [str_cmd_timer]
     call cmd_is
@@ -7871,6 +8066,10 @@ cmd_execute:
 
 .mmapi:
     call mmapi_test
+    ret
+
+.ctxtest:
+    call context_switch_test
     ret
 
 .timer:
@@ -8438,9 +8637,17 @@ kernel_entry:
     jne .legacy_idle
     hlt
 
-    ; Timer IRQ is intentionally not allowed to touch the framebuffer.
-    ; Keep the original solid cursor stable while validating the keyboard
-    ; path with the new APIC timer enabled.
+    ; Timer IRQ only updates lapic_timer_ticks. Blink is handled here,
+    ; outside the interrupt handler, using the original solid cursor.
+    mov rax, [lapic_timer_ticks]
+    mov rcx, [last_cursor_tick]
+    sub rax, rcx
+    cmp rax, CURSOR_BLINK_MS
+    jb .kernel_loop
+
+    mov rax, [lapic_timer_ticks]
+    mov [last_cursor_tick], rax
+    call cursor_toggle
     jmp .kernel_loop
 
 .legacy_idle:
@@ -8996,7 +9203,11 @@ ps2_keyboard_read:
     cmp al, 0x58
     ja .nokey
 
-    movzx eax, byte [ps2_scancode_table + rax]
+    ; AL contains the Set-1 scancode. Do NOT use RAX directly as the
+    ; table index: IN AL only updates AL and leaves the upper RAX bits
+    ; unchanged. A stale upper RAX would address the wrong memory.
+    movzx edx, al
+    movzx eax, byte [ps2_scancode_table + rdx]
     test al, al
     jz .nokey
 
@@ -9119,6 +9330,12 @@ last_cursor_tick:
 
 cursor_shown:
     db 0
+
+; Saved framebuffer pixels underneath the cursor.
+; 9 * 10 pixels * 4 bytes = 360 bytes.
+align 16
+cursor_saved:
+    times (CHAR_W * CHAR_H) dd 0
 
 align 4
 blink_counter:
@@ -9419,6 +9636,7 @@ msg_help:
     db "  slabtest    - test Slab allocator",10
     db "  hhvmm       - test Higher-Half VMM",10
     db "  mmapi       - test MM API",10
+    db "  ctxtest     - test cooperative context switching",10
     db "  timer       - show Local APIC timer state",10
     db "  exit        - exit boot services",10
     db 0
@@ -9781,11 +9999,19 @@ zone_dma32_limit_val:
 str_cmd_mmapi:
     db "mmapi",0
 
+str_cmd_ctxtest:
+    db "ctxtest",0
+
 msg_mmapi_v1:
     db "MM API test",10,0
 
 msg_mmapi_ok:
     db "MM API: OK",10,0
+
+msg_ctxtest_ok:
+    db "Context switch: OK (fresh + resume)",10,0
+msg_ctxtest_fail:
+    db "Context switch: FAIL",10,0
 
 msg_mmapi_fail:
     db "MM API: FAIL",10,0
@@ -9961,6 +10187,27 @@ pmm_cache:
 
 align 8
 pml4_ptr:             dq 0
+align 16
+ctx_main:
+    times CTX_SIZE db 0
+
+align 16
+ctx_test:
+    times CTX_SIZE db 0
+
+align 4096
+ctx_test_stack_bottom:
+    times THREAD_STACK_SIZE db 0
+ctx_test_stack_top:
+
+align 8
+ctx_test_entered:
+    dq 0
+ctx_test_resumed:
+    dq 0
+ctx_test_returned:
+    dq 0
+
 align 16
 gdt:
     dq 0x0000000000000000
