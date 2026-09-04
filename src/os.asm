@@ -4228,6 +4228,7 @@ heap_test:
 
     lea r9, [msg_heaptest_ok]
     call draw_text
+    xor eax, eax
     ret
 
 .fail:
@@ -4238,6 +4239,7 @@ heap_test:
 
     lea r9, [msg_heaptest_fail]
     call draw_text
+    mov eax, 1
     ret
 
 mm_alloc_page:
@@ -4359,6 +4361,7 @@ kmem_test:
 
     lea r9, [msg_kmemtest_ok]
     call draw_text
+    xor eax, eax
     ret
 
 .fail_free:
@@ -4371,6 +4374,7 @@ kmem_test:
 
     lea r9, [msg_kmemtest_fail]
     call draw_text
+    mov eax, 1
     ret
 
 ;================ PMM_ALLOC_ORDER_FLAGS =================
@@ -4580,6 +4584,7 @@ mm_flags_test:
 
     lea r9, [msg_mmflags_ok]
     call draw_text
+    xor eax, eax
     ret
 
 .fail_free:
@@ -4593,6 +4598,7 @@ mm_flags_test:
 
     lea r9, [msg_mmflags_fail]
     call draw_text
+    mov eax, 1
     ret
 
 buddy_test:
@@ -4649,6 +4655,7 @@ buddy_test:
 
     lea r9, [msg_buddytest_ok]
     call draw_text
+    xor eax, eax
     ret
 
 .fail_free_order2:
@@ -4667,6 +4674,7 @@ buddy_test:
 
     lea r9, [msg_buddytest_fail]
     call draw_text
+    mov eax, 1
     ret
 
 cmd_append_char:
@@ -5500,6 +5508,7 @@ buddy_stress_test:
 .ok:
     lea r9, [msg_buddystress_ok]
     call draw_text
+    xor eax, eax
 
     pop r15
     pop r14
@@ -5510,6 +5519,7 @@ buddy_stress_test:
 .fail:
     lea r9, [msg_buddystress_fail]
     call draw_text
+    mov eax, 1
 
     pop r15
     pop r14
@@ -5979,8 +5989,10 @@ buddy_pmm_test:
     mov rdx, 3
     call buddy_pmm_free
 
+    call buddy_pmm_reset
     lea r9, [msg_bpmm_ok]
     call draw_text
+    xor eax, eax
 
     pop r15
     pop r14
@@ -5989,8 +6001,10 @@ buddy_pmm_test:
     ret
 
 .fail:
+    call buddy_pmm_reset
     lea r9, [msg_bpmm_fail]
     call draw_text
+    mov eax, 1
 
     pop r15
     pop r14
@@ -6083,6 +6097,7 @@ zonetest:
 
     lea r9, [msg_zonetest_ok]
     call draw_text
+    xor eax, eax
 
     pop r14
     pop r13
@@ -6110,6 +6125,7 @@ zonetest:
 .fail:
     lea r9, [msg_zonetest_fail]
     call draw_text
+    mov eax, 1
 
     pop r14
     pop r13
@@ -6398,6 +6414,7 @@ slabtest:
 
     lea r9, [msg_slabtest_ok]
     call draw_text
+    xor eax, eax
 
     pop r15
     pop r14
@@ -6409,6 +6426,7 @@ slabtest:
 .fail:
     lea r9, [msg_slabtest_fail]
     call draw_text
+    mov eax, 1
 
     pop r15
     pop r14
@@ -7687,6 +7705,7 @@ mmapi_test:
 
     lea r9, [msg_mmapi_ok]
     call draw_text
+    xor eax, eax
     ret
 
 .fail_kfree:
@@ -7704,6 +7723,7 @@ mmapi_test:
 
     lea r9, [msg_mmapi_fail]
     call draw_text
+    mov eax, 1
     ret
 
 ;================ FULL KERNEL DIAGNOSTIC =================
@@ -7711,140 +7731,331 @@ mmapi_test:
 ; It runs the complete kernel test stack and, for the scheduler/process
 ; layers, checks the invariants that explain *why* a test failed.
 kernel_diagnostic:
-    ; Run diagnostics with the kernel-owned stack.  Disable interrupts while
-    ; establishing diagnostic state; individual scheduler/preemption tests
-    ; explicitly re-enable them when their own invariants are ready.
+    ;=======================================================================
+    ; DEEP KERNEL DIAGNOSTIC
+    ;
+    ; `diag` is intentionally exhaustive.  It checks:
+    ;   - firmware/boot hand-off
+    ;   - framebuffer + console + input plumbing
+    ;   - GDT/TSS/IDT/CPU control state
+    ;   - paging/CR3/HHDM
+    ;   - LAPIC/timer state
+    ;   - PMM/VMM/heap/KMEM/MM flags
+    ;   - Buddy/Buddy-PMM/Zones/Slab
+    ;   - MM API + context switching
+    ;   - thread/process lifecycle
+    ;   - cooperative + preemptive scheduling
+    ;   - PMM/VMM stress
+    ;
+    ; Every test has:
+    ;   1) a human-readable name
+    ;   2) a reason string
+    ;   3) a before/after state snapshot
+    ;   4) exception recovery
+    ;   5) return-code reporting
+    ;
+    ; The diagnostic never hides a failure behind a bare number.
+    ;=======================================================================
     push rbx
     push r12
     push r13
     push r14
     push r15
     sub rsp, 8
+
     pushfq
     pop r15
     cli
 
-    ; Phase 1 is established before the first diagnostic output so a fault
-    ; in diagnostic startup is attributed to the foundation phase.
     mov qword [diag_phase], 1
     mov qword [diag_pass_count], 0
     mov qword [diag_fail_count], 0
+    mov qword [diag_blocked_count], 0
+    mov qword [diag_failed_list_count], 0
     mov qword [diag_test_index], 0
     mov qword [diag_test_name_ptr], 0
+    mov qword [diag_reason_ptr], 0
+    mov qword [diag_last_return], 0
 
-    lea r9, [msg_diag_header]
+    lea r9, [msg_diag2_header]
+    call draw_text
+    call diag_print_environment
+
+    ;---------------- 1. BOOT / PLATFORM FOUNDATION ----------------
+    lea r9, [msg_diag2_phase1]
     call draw_text
 
-    ; The order is intentional: memory foundations first, then object
-    ; lifetimes, then scheduling, then process isolation. Stress tests run last.
-    lea r9, [msg_diag_phase_foundation]
-    call draw_text
-
-    lea rdi, [str_diag_pmm]
-    lea rsi, [diag_test_pmm]
-    call diag_run_one
-    lea rdi, [str_diag_vmm]
-    lea rsi, [diag_test_vmm]
-    call diag_run_one
-    lea rdi, [str_diag_heap]
-    lea rsi, [diag_test_heap]
-    call diag_run_one
-    lea rdi, [str_diag_kmem]
-    lea rsi, [kmem_test]
-    call diag_run_one
-    lea rdi, [str_diag_mmflags]
-    lea rsi, [mm_flags_test]
-    call diag_run_one
-    lea rdi, [str_diag_buddy]
-    lea rsi, [buddy_test]
-    call diag_run_one
-    lea rdi, [str_diag_buddy_arena]
-    lea rsi, [buddy_arena_test]
-    call diag_run_one
-    lea rdi, [str_diag_buddy_stress]
-    lea rsi, [buddy_stress_test]
-    call diag_run_one
-    lea rdi, [str_diag_buddy_pmm]
-    lea rsi, [buddy_pmm_test]
-    call diag_run_one
-    lea rdi, [str_diag_zones]
-    lea rsi, [zonetest]
-    call diag_run_one
-    lea rdi, [str_diag_slab]
-    lea rsi, [slabtest]
-    call diag_run_one
-    lea rdi, [str_diag_hhvmm]
-    lea rsi, [hhvmm_test]
-    call diag_run_one
-    lea rdi, [str_diag_mmapi]
-    lea rsi, [mmapi_test]
-    call diag_run_one
-    lea rdi, [str_diag_context]
-    lea rsi, [context_switch_test]
+    lea rdi, [str_diag2_boot]
+    lea rsi, [diag_test_boot]
+    lea rdx, [reason_diag2_boot]
     call diag_run_one
 
+    lea rdi, [str_diag2_stack]
+    lea rsi, [diag_test_stack]
+    lea rdx, [reason_diag2_stack]
+    call diag_run_one
+
+    lea rdi, [str_diag2_video]
+    lea rsi, [diag_test_video]
+    lea rdx, [reason_diag2_video]
+    call diag_run_one
+
+    lea rdi, [str_diag2_console]
+    lea rsi, [diag_test_console]
+    lea rdx, [reason_diag2_console]
+    call diag_run_one
+
+    lea rdi, [str_diag2_input]
+    lea rsi, [diag_test_input]
+    lea rdx, [reason_diag2_input]
+    call diag_run_one
+
+    lea rdi, [str_diag2_serial]
+    lea rsi, [diag_test_serial]
+    lea rdx, [reason_diag2_serial]
+    call diag_run_one
+
+    ;---------------- 2. CPU / INTERRUPT FOUNDATION ----------------
     mov qword [diag_phase], 2
-    lea r9, [msg_diag_phase_threads]
+    lea r9, [msg_diag2_phase2]
     call draw_text
-    lea rdi, [str_diag_thread]
-    lea rsi, [thread_lifecycle_test]
+
+    lea rdi, [str_diag2_gdt]
+    lea rsi, [diag_test_gdt]
+    lea rdx, [reason_diag2_gdt]
     call diag_run_one
 
+    lea rdi, [str_diag2_tss]
+    lea rsi, [diag_test_tss]
+    lea rdx, [reason_diag2_tss]
+    call diag_run_one
+
+    lea rdi, [str_diag2_idt]
+    lea rsi, [diag_test_idt]
+    lea rdx, [reason_diag2_idt]
+    call diag_run_one
+
+    lea rdi, [str_diag2_interrupt_state]
+    lea rsi, [diag_test_interrupt_state]
+    lea rdx, [reason_diag2_interrupt_state]
+    call diag_run_one
+
+    ;---------------- 3. MEMORY / PAGING FOUNDATION ----------------
     mov qword [diag_phase], 3
-    lea r9, [msg_diag_phase_process]
+    lea r9, [msg_diag2_phase3]
     call draw_text
-    call diag_process_detailed
 
+    lea rdi, [str_diag2_memory_state]
+    lea rsi, [diag_test_memory_state]
+    lea rdx, [reason_diag2_memory_state]
+    call diag_run_one
+
+    lea rdi, [str_diag2_paging]
+    lea rsi, [diag_test_paging]
+    lea rdx, [reason_diag2_paging]
+    call diag_run_one
+
+    lea rdi, [str_diag2_pmm]
+    lea rsi, [diag_test_pmm_deep]
+    lea rdx, [reason_diag2_pmm]
+    call diag_run_one
+
+    lea rdi, [str_diag2_vmm]
+    lea rsi, [diag_test_vmm_deep]
+    lea rdx, [reason_diag2_vmm]
+    call diag_run_one
+
+    lea rdi, [str_diag2_hhdm]
+    lea rsi, [diag_test_hhdm]
+    lea rdx, [reason_diag2_hhdm]
+    call diag_run_one
+
+    lea rdi, [str_diag2_highmap]
+    lea rsi, [diag_test_highmap]
+    lea rdx, [reason_diag2_highmap]
+    call diag_run_one
+
+    ;---------------- 4. ALLOCATORS ----------------
     mov qword [diag_phase], 4
-    lea r9, [msg_diag_phase_sched]
+    lea r9, [msg_diag2_phase4]
     call draw_text
-    call diag_scheduler_detailed
 
+    lea rdi, [str_diag2_heap]
+    lea rsi, [diag_test_heap_deep]
+    lea rdx, [reason_diag2_heap]
+    call diag_run_one
+
+    lea rdi, [str_diag2_heap_test]
+    lea rsi, [heap_test]
+    lea rdx, [reason_diag2_heap_test]
+    call diag_run_one
+
+    lea rdi, [str_diag2_kmem]
+    lea rsi, [kmem_test]
+    lea rdx, [reason_diag2_kmem]
+    call diag_run_one
+
+    lea rdi, [str_diag2_mmflags]
+    lea rsi, [mm_flags_test]
+    lea rdx, [reason_diag2_mmflags]
+    call diag_run_one
+
+    lea rdi, [str_diag2_buddy]
+    lea rsi, [buddy_test]
+    lea rdx, [reason_diag2_buddy]
+    call diag_run_one
+
+    lea rdi, [str_diag2_buddy_arena]
+    lea rsi, [buddy_arena_test]
+    lea rdx, [reason_diag2_buddy_arena]
+    call diag_run_one
+
+    lea rdi, [str_diag2_buddy_stress]
+    lea rsi, [buddy_stress_test]
+    lea rdx, [reason_diag2_buddy_stress]
+    call diag_run_one
+
+    lea rdi, [str_diag2_buddy_pmm]
+    lea rsi, [buddy_pmm_test]
+    lea rdx, [reason_diag2_buddy_pmm]
+    call diag_run_one
+
+    ; Zones test uses the real PMM bitmap, not the standalone Buddy-PMM
+    ; arena.  Reset the latter before entering the test so allocator metadata
+    ; from the preceding self-test is completely canonical.
+    call buddy_pmm_reset
+
+    lea rdi, [str_diag2_zones]
+    lea rsi, [zonetest]
+    lea rdx, [reason_diag2_zones]
+    call diag_run_one
+
+    lea rdi, [str_diag2_slab]
+    lea rsi, [slabtest]
+    lea rdx, [reason_diag2_slab]
+    call diag_run_one
+
+    lea rdi, [str_diag2_mmapi]
+    lea rsi, [mmapi_test]
+    lea rdx, [reason_diag2_mmapi]
+    call diag_run_one
+
+    ;---------------- 5. THREAD / PROCESS / SCHEDULER ----------------
     mov qword [diag_phase], 5
-    lea r9, [msg_diag_phase_preempt]
+    lea r9, [msg_diag2_phase5]
     call draw_text
-    call diag_preempt_detailed
 
-    cmp qword [diag_fail_count], 0
-    jne .skip_stress_after_failure
+    lea rdi, [str_diag2_context]
+    lea rsi, [context_switch_test]
+    lea rdx, [reason_diag2_context]
+    call diag_run_one
+
+    lea rdi, [str_diag2_thread]
+    lea rsi, [thread_lifecycle_test]
+    lea rdx, [reason_diag2_thread]
+    call diag_run_one
+
+    ; Establish the shell/main execution context before validating
+    ; current_thread.  The lifecycle test intentionally leaves no worker
+    ; current, so current_thread may otherwise be NULL here.
+    lea rdi, [scheduler_test_main]
+    call scheduler_main_init
+
+    lea rdi, [str_diag2_thread_invariants]
+    lea rsi, [diag_test_thread_invariants]
+    lea rdx, [reason_diag2_thread_invariants]
+    call diag_run_one
+
+    lea rdi, [str_diag2_process]
+    lea rsi, [process_model_test]
+    lea rdx, [reason_diag2_process]
+    call diag_run_one
+
+    lea rdi, [str_diag2_process_invariants]
+    lea rsi, [diag_test_process_invariants]
+    lea rdx, [reason_diag2_process_invariants]
+    call diag_run_one
+
+    lea rdi, [str_diag2_scheduler]
+    lea rsi, [scheduler_test]
+    lea rdx, [reason_diag2_scheduler]
+    call diag_run_one
+
+    ; diag itself runs with IF=0 for deterministic exception recovery.
+    ; The preemptive scheduler test requires real LAPIC interrupts, so allow
+    ; interrupts only while this one test is executing.
+    sti
+    lea rdi, [str_diag2_preempt]
+    lea rsi, [preemptive_scheduler_test]
+    lea rdx, [reason_diag2_preempt]
+    call diag_run_one
+    cli
+
+    lea rdi, [str_diag2_lapic]
+    lea rsi, [diag_test_lapic]
+    lea rdx, [reason_diag2_lapic]
+    call diag_run_one
+
+    ;---------------- 6. STRESS / FINAL CONSISTENCY ----------------
     mov qword [diag_phase], 6
-    lea r9, [msg_diag_phase_stress]
+    lea r9, [msg_diag2_phase6]
     call draw_text
-    lea rdi, [str_diag_pmm_stress]
+
+    lea rdi, [str_diag2_pmm_stress]
     lea rsi, [pmm_stress_test]
+    lea rdx, [reason_diag2_pmm_stress]
     call diag_run_one
-    cmp byte [vmm_active], 1
-    jne .skip_vmm_stress
-    lea rdi, [str_diag_vmm_stress]
+
+    lea rdi, [str_diag2_vmm_stress]
     lea rsi, [vmm_stress_test]
+    lea rdx, [reason_diag2_vmm_stress]
     call diag_run_one
-    jmp .summary
-.skip_vmm_stress:
-    lea r9, [str_diag_vmm_stress_skip]
-    call draw_text
-    jmp .summary
 
-.skip_stress_after_failure:
-    lea r9, [msg_diag_stress_skipped]
+    lea rdi, [str_diag2_final]
+    lea rsi, [diag_test_final]
+    lea rdx, [reason_diag2_final]
+    call diag_run_one
+
+    ;---------------- SUMMARY ----------------
+    lea r9, [msg_diag2_summary]
     call draw_text
 
-.summary:
-    lea r9, [msg_diag_summary]
+    lea r9, [msg_diag2_pass]
     call draw_text
     mov rcx, [diag_pass_count]
     call print_hex64
-    lea r9, [msg_diag_failcount]
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [msg_diag2_fail]
     call draw_text
     mov rcx, [diag_fail_count]
     call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [msg_diag2_blocked]
+    call draw_text
+    mov rcx, [diag_blocked_count]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
     cmp qword [diag_fail_count], 0
-    jne .not_clean
-    lea r9, [msg_diag_all_pass]
+    je .no_failed_tests
+
+    call diag_print_failed_tests
+    jmp .has_fail
+
+.no_failed_tests:
+    lea r9, [msg_diag2_clean]
     call draw_text
     jmp .done
-.not_clean:
-    lea r9, [msg_diag_has_failures]
+
+.has_fail:
+    lea r9, [msg_diag2_dirty]
     call draw_text
+
 .done:
     push r15
     popfq
@@ -7856,30 +8067,105 @@ kernel_diagnostic:
     pop rbx
     ret
 
-; rdi = test name, rsi = function pointer returning EAX=0 success, nonzero fail.
+
+;-----------------------------------------------------------------------
+; Print a complete diagnostic environment snapshot.
+; This is deliberately textual: the numbers are accompanied by labels.
+;-----------------------------------------------------------------------
+diag_print_environment:
+    push r12
+
+    lea r9, [msg_diag2_environment]
+    call draw_text
+
+    lea r9, [str_d2_kernel_stage]
+    call draw_text
+    movzx rcx, byte [kernel_stage]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_d2_vmm_active]
+    call draw_text
+    movzx rcx, byte [vmm_active]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_d2_hh_active]
+    call draw_text
+    movzx rcx, byte [hh_active]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_d2_pmm_free]
+    call draw_text
+    mov rcx, [boot_info + BootInfo.pmm_free_pages]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_d2_current_thread]
+    call draw_text
+    mov rcx, [current_thread]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_d2_current_process]
+    call draw_text
+    mov rcx, [current_process]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_d2_timer_ticks]
+    call draw_text
+    mov rcx, [lapic_timer_ticks]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    pop r12
+    ret
+
+
+; rdi = test name
+; rsi = function pointer, EAX=0 PASS, EAX!=0 FAIL
+; rdx = human-readable failure reason
 diag_run_one:
     push r12
     push r13
     push r14
     push r15
     sub rsp, 8
+
     mov r12, rdi
     mov r13, rsi
+    mov r14, rdx
+
     mov [diag_test_name_ptr], r12
+    mov [diag_reason_ptr], r14
     inc qword [diag_test_index]
 
-    lea r9, [str_diag_test_prefix]
+    lea r9, [str_diag2_test_start]
+    call draw_text
+    mov rcx, [diag_test_index]
+    call print_hex64
+    lea r9, [str_diag2_test_mid]
     call draw_text
     mov r9, r12
     call draw_text
-    mov r9b, ':'
-    call console_putc
-    mov r9b, ' '
+    lea r9, [str_diag2_test_ellipsis]
+    call draw_text
+    mov r9b, CHAR_LF
     call console_putc
 
-    ; Establish an exception recovery landing pad on the current diagnostic
-    ; stack.  A broken test therefore becomes FAIL + a precise exception
-    ; record instead of destroying the diagnostic run.
+    call diag_snapshot
+
+    ; Exception-safe execution.  The exception handler jumps back here if
+    ; a test triggers #GP/#PF/#UD/etc. and records the CPU fault state first.
     lea rax, [.fault_recovery]
     mov [diag_fault_recovery_rip], rax
     mov [diag_fault_recovery_rsp], rsp
@@ -7888,422 +8174,1007 @@ diag_run_one:
     mov qword [diag_fault_error], 0
     mov qword [diag_fault_rip], 0
     mov qword [diag_fault_cr2], 0
+
     call r13
+
     mov byte [diag_fault_active], 0
+    mov [diag_last_return], rax
     test eax, eax
     jnz .fail
+
     inc qword [diag_pass_count]
-    lea r9, [msg_diag_ok]
+    lea r9, [msg_diag2_pass_one]
     call draw_text
+    call diag_snapshot
     jmp .done
 
 .fault_recovery:
     cli
     mov byte [diag_fault_active], 0
-    ; Skip the alignment padding created immediately before the test call.
-    ; The saved r15/r14/r13/r12 values remain directly below it.
     add rsp, 8
-    mov eax, 1
+    mov qword [diag_last_return], 1
     jmp .fail_exception
 
 .fail:
     inc qword [diag_fail_count]
-    lea r9, [msg_diag_fail]
+    call diag_record_failure
+
+    lea r9, [msg_diag2_fail_one]
     call draw_text
-    lea r9, [msg_diag_detail]
+
+    lea r9, [str_diag2_return]
     call draw_text
-    lea r9, [msg_diag_generic_return]
+    mov rcx, [diag_last_return]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_diag2_reason]
     call draw_text
+    mov r9, [diag_reason_ptr]
+    call draw_text
+
+    call diag_snapshot
     jmp .done
 
 .fail_exception:
     inc qword [diag_fail_count]
-    lea r9, [msg_diag_fail]
+    call diag_record_failure
+
+    lea r9, [msg_diag2_exception]
     call draw_text
-    lea r9, [msg_diag_exception]
+
+    lea r9, [str_diag2_reason]
     call draw_text
-    lea r9, [msg_diag_exception_test]
+    mov r9, [diag_reason_ptr]
     call draw_text
-    mov r9, [diag_test_name_ptr]
-    call draw_text
-    mov r9b, CHAR_LF
-    call console_putc
+
     lea r9, [str_vector]
     call draw_text
     mov rcx, [diag_fault_vector]
     call print_hex64
+
     lea r9, [str_error]
     call draw_text
     mov rcx, [diag_fault_error]
     call print_hex64
+
     lea r9, [str_rip]
     call draw_text
     mov rcx, [diag_fault_rip]
     call print_hex64
-    mov r9b, CHAR_LF
-    call console_putc
+
     lea r9, [str_cr2]
     call draw_text
     mov rcx, [diag_fault_cr2]
     call print_hex64
     mov r9b, CHAR_LF
     call console_putc
-    jmp .done
+
+    call diag_snapshot
+
+.pre_kernel_mode:
+    ; Firmware phase: only objects that are guaranteed to exist before the
+    ; native kernel hand-off are tested.  Kernel-only subsystems are not
+    ; reported as failures because they have not been initialized yet.
+    mov qword [diag_pass_count], 0
+    mov qword [diag_fail_count], 0
+    mov qword [diag_blocked_count], 1
+    mov qword [diag_failed_list_count], 0
+
+    lea r9, [msg_diag2_pre_kernel]
+    call draw_text
+
+    lea rdi, [str_diag2_boot]
+    lea rsi, [diag_test_boot]
+    lea rdx, [reason_diag2_boot]
+    call diag_run_one
+
+    lea rdi, [str_diag2_video]
+    lea rsi, [diag_test_video]
+    lea rdx, [reason_diag2_video]
+    call diag_run_one
+
+    lea rdi, [str_diag2_console]
+    lea rsi, [diag_test_console]
+    lea rdx, [reason_diag2_console]
+    call diag_run_one
+
+    lea rdi, [str_diag2_input]
+    lea rsi, [diag_test_input]
+    lea rdx, [reason_diag2_input]
+    call diag_run_one
+
+    lea rdi, [str_diag2_serial]
+    lea rsi, [diag_test_serial]
+    lea rdx, [reason_diag2_serial]
+    call diag_run_one
+
+    lea r9, [msg_diag2_pre_kernel_footer]
+    call draw_text
 
 .done:
-    ; Normal path still has the 8-byte alignment pad.  Exception recovery
-    ; already consumed it before entering the failure reporter.
     cmp qword [diag_fault_vector], 0
-    jne .done_no_pad
+    jne .no_pad
     add rsp, 8
-.done_no_pad:
+.no_pad:
     pop r15
     pop r14
     pop r13
     pop r12
     ret
 
-; Small wrappers keep the diagnostic independent of command handlers.
-diag_test_pmm:
+
+;-----------------------------------------------------------------------
+; Save a failed test for the final human-readable report.
+; r12 = test name, r14 = human-readable reason.
+; Maximum: 64 failures.
+;-----------------------------------------------------------------------
+diag_record_failure:
+    ; IMPORTANT: r12/r14 may be destroyed by the test itself.
+    ; Always use the stable pointers saved by diag_run_one.
+    push rax
+    push rcx
+    push rdx
+
+    mov rcx, [diag_failed_list_count]
+    cmp rcx, 64
+    jae .done
+
+    mov rax, rcx
+    shl rax, 3
+
+    lea rdx, [diag_failed_names]
+    mov r12, [diag_test_name_ptr]
+    mov [rdx + rax], r12
+
+    lea rdx, [diag_failed_reasons]
+    mov r12, [diag_reason_ptr]
+    mov [rdx + rax], r12
+
+    inc qword [diag_failed_list_count]
+
+.done:
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+
+;-----------------------------------------------------------------------
+; Print an unsigned 64-bit integer in DECIMAL.
+; Used only for the final failure numbering so the report is human-first.
+;-----------------------------------------------------------------------
+diag_print_dec:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+
+    test rax, rax
+    jnz .convert
+
+    mov r9b, '0'
+    call console_putc
+    jmp .done
+
+.convert:
+    xor ecx, ecx
+    mov ebx, 10
+
+.loop:
+    xor edx, edx
+    div rbx
+    add dl, '0'
+    push rdx
+    inc ecx
+    test rax, rax
+    jnz .loop
+
+.print:
+    pop rdx
+    mov r9b, dl
+    call console_putc
+    loop .print
+
+.done:
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+
+;-----------------------------------------------------------------------
+; Final report: ONLY the failed tests.
+;
+; Format:
+;
+;   FAILED TESTS
+;
+;   1. Test name
+;      Problem: human-readable reason
+;
+;   2. Test name
+;      Problem: human-readable reason
+;
+; No return codes, no vectors, no addresses here.  The low-level data
+; remains available in the per-test output above when needed.
+;-----------------------------------------------------------------------
+diag_print_failed_tests:
     push r12
     push r13
-    call pmm_alloc_page
-    test rax, rax
-    jz .fail
-    mov r12, rax                    ; physical address returned by PMM
-    mov rcx, r12
-    call phys_to_virt
-    test rax, rax
-    jz .free_fail
-    mov r13, rax                    ; mapped virtual address
-    mov rcx, r13
-    call zero_page
-    mov rcx, r12                    ; free physical address
-    call pmm_free_page
-    xor eax, eax
-    pop r13
-    pop r12
-    ret
-.free_fail:
-    mov rcx, r12
-    call pmm_free_page
-.fail:
-    mov eax, 1
+    push r14
+    push r15
+
+    mov r13, [diag_failed_list_count]
+    test r13, r13
+    jz .none
+
+    lea r9, [msg_diag2_failed_header]
+    call draw_text
+
+    xor r12d, r12d
+
+.loop:
+    cmp r12, r13
+    jae .done
+
+    mov rax, r12
+    inc rax
+    call diag_print_dec
+
+    lea r9, [str_diag2_failure_dot]
+    call draw_text
+
+    lea r14, [diag_failed_names]
+    mov rax, r12
+    shl rax, 3
+    mov r9, [r14 + rax]
+    call draw_text
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_diag2_problem]
+    call draw_text
+
+    ; draw_text/console_putc are free to clobber RAX. Recompute the
+    ; array offset before reading the reason pointer; otherwise every
+    ; failure can incorrectly display the same reason.
+    mov rax, r12
+    shl rax, 3
+    lea r14, [diag_failed_reasons]
+    mov r9, [r14 + rax]
+    call draw_text
+    mov r9b, CHAR_LF
+    call console_putc
+    mov r9b, CHAR_LF
+    call console_putc
+
+    inc r12
+    jmp .loop
+
+.done:
+    pop r15
+    pop r14
     pop r13
     pop r12
     ret
 
-diag_test_vmm:
+.none:
+    lea r9, [msg_diag2_no_failed]
+    call draw_text
+    jmp .done
+
+
+; Snapshot of the mutable kernel state around EVERY diagnostic test.
+diag_snapshot:
+    push r12
+
+    lea r9, [str_diag2_snapshot]
+    call draw_text
+
+    lea r9, [str_d2_ready]
+    call draw_text
+    mov rcx, [ready_count]
+    call print_hex64
+
+    lea r9, [str_d2_all]
+    call draw_text
+    mov rcx, [all_thread_count]
+    call print_hex64
+
+    lea r9, [str_d2_irq]
+    call draw_text
+    mov rcx, [scheduler_in_irq]
+    call print_hex64
+
+    lea r9, [str_d2_preempts]
+    call draw_text
+    mov rcx, [scheduler_preemptions]
+    call print_hex64
+
+    lea r9, [str_d2_ticks]
+    call draw_text
+    mov rcx, [lapic_timer_ticks]
+    call print_hex64
+
+    lea r9, [str_d2_free]
+    call draw_text
+    mov rcx, [boot_info + BootInfo.pmm_free_pages]
+    call print_hex64
+
+    mov r9b, CHAR_LF
+    call console_putc
+
+    pop r12
+    ret
+
+
+;---------------------- DEEP FOUNDATION CHECKS ----------------------
+
+diag_test_boot:
+    cmp byte [hal_uefi_ready], 1
+    jne .fail_hal
+    cmp qword [bs], 0
+    je .fail_bs
+    cmp qword [image_handle], 0
+    je .fail_image
+    cmp qword [conin], 0
+    je .fail_conin
+    cmp qword [boot_info], 0
+    je .fail_bootinfo
+    cmp qword [boot_info + BootInfo.mem_map], 0
+    je .fail_map
+    cmp qword [boot_info + BootInfo.mem_size], 0
+    je .fail_mapsize
+    cmp qword [boot_info + BootInfo.mem_desc_size], 40
+    jb .fail_desc
+    cmp qword [boot_info + BootInfo.pmm_bitmap], 0
+    je .fail_pmm
+    cmp qword [boot_info + BootInfo.pmm_total_pages], 0
+    je .fail_pages
+    cmp byte [memory_manager_ready], 1
+    jne .fail_mm
+    xor eax, eax
+    ret
+.fail_hal:    lea r9,[reason_diag2_boot_hal]; jmp .text_fail
+.fail_bs:     lea r9,[reason_diag2_boot_bs]; jmp .text_fail
+.fail_image:  lea r9,[reason_diag2_boot_image]; jmp .text_fail
+.fail_conin:  lea r9,[reason_diag2_boot_conin]; jmp .text_fail
+.fail_bootinfo: lea r9,[reason_diag2_boot_info]; jmp .text_fail
+.fail_map:    lea r9,[reason_diag2_boot_map]; jmp .text_fail
+.fail_mapsize: lea r9,[reason_diag2_boot_mapsize]; jmp .text_fail
+.fail_desc:   lea r9,[reason_diag2_boot_desc]; jmp .text_fail
+.fail_pmm:    lea r9,[reason_diag2_boot_bitmap]; jmp .text_fail
+.fail_pages:  lea r9,[reason_diag2_boot_pages]; jmp .text_fail
+.fail_mm:     lea r9,[reason_diag2_boot_mm]; jmp .text_fail
+.text_fail:
+    mov eax, 1
+    ret
+
+
+diag_test_stack:
+    lea rax, [kernel_stack_top]
+    test rax, 0xF
+    jnz .fail
+    lea rdx, [kernel_stack_bottom]
+    cmp rax, rdx
+    jbe .fail
+    mov rax, [kernel_stack_bottom]
+    cmp rax, THREAD_CANARY
+    jne .fail
+    lea rax, [ist_stack_top]
+    test rax, 0xF
+    jnz .fail
+    lea rdx, [ist_stack_bottom]
+    cmp rax, rdx
+    jbe .fail
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+
+diag_test_video:
+    mov rax, [video + Video.fb]
+    test rax, rax
+    jz .fail
+    mov rax, [video + Video.w]
+    test rax, rax
+    jz .fail
+    mov rax, [video + Video.h]
+    test rax, rax
+    jz .fail
+    mov rax, [video + Video.sl]
+    test rax, rax
+    jz .fail
+    cmp rax, [video + Video.w]
+    jb .fail
+    mov rax, [boot_info + BootInfo.fb]
+    cmp rax, [video + Video.fb]
+    jne .fail
+    mov rax, [boot_info + BootInfo.width]
+    cmp rax, [video + Video.w]
+    jne .fail
+    mov rax, [boot_info + BootInfo.height]
+    cmp rax, [video + Video.h]
+    jne .fail
+    mov rax, [boot_info + BootInfo.stride]
+    cmp rax, [video + Video.sl]
+    jne .fail
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+
+diag_test_console:
+    mov rax, [video + Video.w]
+    cmp rax, CHAR_W
+    jb .fail
+    mov rax, [video + Video.h]
+    cmp rax, CHAR_H
+    jb .fail
+
+    mov rax, [video + Video.cx]
+    mov rdx, [video + Video.w]
+    sub rdx, CHAR_W
+    cmp rax, rdx
+    ja .fail
+
+    mov rax, [video + Video.cy]
+    mov rdx, [video + Video.h]
+    sub rdx, CHAR_H
+    cmp rax, rdx
+    ja .fail
+
+    cmp byte [cursor_shown], 1
+    ja .fail
+
+    ; Exercise the exact draw/erase pair without leaving a cursor behind.
+    call cursor_draw
+    cmp byte [cursor_shown], 1
+    jne .fail_erase
+    call cursor_erase
+    cmp byte [cursor_shown], 0
+    jne .fail
+
+    xor eax, eax
+    ret
+.fail_erase:
+    call cursor_erase
+.fail:
+    mov eax, 1
+    ret
+
+
+diag_test_input:
+    cmp qword [conin], 0
+    je .fail
+    mov rax, [conin]
+    test rax, rax
+    jz .fail
+    mov rax, [rax]
+    test rax, rax
+    jz .fail
+    mov rdx, [conin]
+    mov rax, [rdx + 16]
+    test rax, rax
+    jz .fail
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+
+diag_test_serial:
+    lea rsi, [s_diag_serial_probe]
+    call serial_puts
+    xor eax, eax
+    ret
+
+
+diag_test_gdt:
+    sgdt [diag_gdtr]
+    movzx eax, word [diag_gdtr]
+    cmp eax, gdt_end-gdt-1
+    jne .fail
+    mov rax, [diag_gdtr + 2]
+    lea rdx, [gdt]
+    cmp rax, rdx
+    jne .fail
+    mov ax, cs
+    cmp ax, KERNEL_CS
+    jne .fail
+    mov ax, ds
+    cmp ax, 0x10
+    jne .fail
+    mov ax, es
+    cmp ax, 0x10
+    jne .fail
+    mov ax, ss
+    cmp ax, 0x10
+    jne .fail
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+
+diag_test_tss:
+    str ax
+    cmp ax, 0x28
+    jne .fail
+    lea rax, [tss]
+    lea rdx, [kernel_stack_top]
+    cmp qword [tss + 4], rdx
+    jne .fail
+    lea rdx, [ist_stack_top]
+    cmp qword [tss + 36], rdx
+    jne .fail
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+
+diag_test_idt:
+    sidt [diag_idtr]
+    movzx eax, word [diag_idtr]
+    cmp eax, (256*16)-1
+    jne .fail
+    mov rax, [diag_idtr + 2]
+    lea rdx, [idt]
+    cmp rax, rdx
+    jne .fail
+
+    xor ecx, ecx
+.loop:
+    cmp ecx, 32
+    jae .ok
+    mov rax, rcx
+    shl rax, 4
+    mov dl, [idt + rax + 5]
+    test dl, 80h
+    jz .fail
+    inc ecx
+    jmp .loop
+.ok:
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+
+diag_test_interrupt_state:
+    pushfq
+    pop rax
+    test rax, (1 << 9)
+    jnz .fail
+    cmp qword [scheduler_in_irq], 0
+    jne .fail
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+
+diag_test_memory_state:
+    mov rax, [boot_info + BootInfo.pmm_total_pages]
+    test rax, rax
+    jz .fail
+    mov rdx, [boot_info + BootInfo.pmm_free_pages]
+    test rdx, rdx
+    jz .fail
+    cmp rdx, rax
+    ja .fail
+    mov rax, [boot_info + BootInfo.pmm_bitmap]
+    test rax, rax
+    jz .fail
+    mov rax, [boot_info + BootInfo.mem_desc_size]
+    cmp rax, 40
+    jb .fail
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+
+diag_test_paging:
+    mov rax, cr0
+    test eax, (1 << 31)
+    jz .fail_pg
+    mov rax, cr4
+    test eax, (1 << 5)
+    jz .fail_pae
+    mov rax, cr3
+    and rax, -4096
+    cmp rax, [pml4_ptr]
+    jne .fail_cr3
     cmp byte [vmm_active], 1
-    jne .skip
+    jne .fail_vmm
     mov rcx, 0x1000
     call vmm_translate
     test rax, rax
+    jz .fail_translate
+    xor eax, eax
+    ret
+.fail_pg:
+    mov eax, 1
+    ret
+.fail_pae:
+    mov eax, 2
+    ret
+.fail_cr3:
+    mov eax, 3
+    ret
+.fail_vmm:
+    mov eax, 4
+    ret
+.fail_translate:
+    mov eax, 5
+    ret
+
+
+diag_test_hhdm:
+    cmp byte [hh_active], 1
+    jne .inactive
+    cmp byte [hh_verified], 1
+    jne .fail
+    mov rax, [hh_pml4_phys]
+    test rax, rax
     jz .fail
-.skip:
+
+    mov rcx, 0x1000
+    call phys_to_virt
+    test rax, rax
+    jz .fail
+    mov r12, rax
+    mov rcx, r12
+    call virt_to_phys
+    cmp rax, 0x1000
+    jne .fail
+    xor eax, eax
+    ret
+.inactive:
+    ; HHDM is a mandatory kernel stage in this image.  Do not silently
+    ; call this PASS if it is absent.
+    mov eax, 1
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+
+diag_test_pmm_deep:
+    mov r12, [boot_info + BootInfo.pmm_free_pages]
+    call pmm_alloc_page
+    test rax, rax
+    jz .fail
+    mov r13, rax
+    mov rcx, r13
+    call phys_to_virt
+    test rax, rax
+    jz .free_fail
+    mov r14, rax
+
+    mov rcx, r14
+    call zero_page
+    cmp qword [r14], 0
+    jne .free_fail
+
+    mov qword [r14], 0xD1A6D1A6D1A6D1A6
+    cmp qword [r14], 0xD1A6D1A6D1A6D1A6
+    jne .free_fail
+
+    mov rcx, r13
+    call pmm_free_page
+
+    cmp qword [boot_info + BootInfo.pmm_free_pages], r12
+    jne .fail
+
+    xor eax, eax
+    ret
+.free_fail:
+    mov rcx, r13
+    call pmm_free_page
+.fail:
+    mov eax, 1
+    ret
+
+
+diag_test_vmm_deep:
+    cmp byte [vmm_active], 1
+    jne .fail
+    mov rcx, VMM_TEST_VADDR
+    call vmm_translate
+    test rax, rax
+    jnz .conflict
+    call pmm_alloc_page
+    test rax, rax
+    jz .fail
+    mov r12, rax
+    mov rcx, r12
+    call zero_page
+
+    mov rcx, VMM_TEST_VADDR
+    mov rdx, r12
+    mov r8, PAGE_WRITABLE
+    call vmm_map_4k
+    test eax, eax
+    jnz .free
+
+    mov rax, VMM_TEST_VADDR
+    mov qword [rax], 0x1122334455667788
+    cmp qword [rax], 0x1122334455667788
+    jne .unmap_free
+
+    mov rcx, VMM_TEST_VADDR
+    call vmm_translate
+    cmp rax, r12
+    jne .unmap_free
+
+    mov rcx, VMM_TEST_VADDR
+    call vmm_unmap_4k
+
+    mov rcx, r12
+    call pmm_free_page
+    xor eax, eax
+    ret
+.unmap_free:
+    mov rcx, VMM_TEST_VADDR
+    call vmm_unmap_4k
+.free:
+    mov rcx, r12
+    call pmm_free_page
+.fail:
+    mov eax, 1
+    ret
+.conflict:
+    mov eax, 1
+    ret
+
+
+diag_test_highmap:
+    cmp byte [vmm_active], 1
+    jne .fail
+    call vmm_map_high
+    test eax, eax
+    jnz .fail
+    mov rcx, VMM_HIGH_BASE
+    add rcx, 0x1000
+    call vmm_translate
+    cmp rax, 0x1000
+    jne .fail
     xor eax, eax
     ret
 .fail:
     mov eax, 1
     ret
 
-diag_test_heap:
-    push r12
+
+diag_test_heap_deep:
     call kheap_init
     test eax, eax
     jnz .fail
-    mov rcx, 64
+    cmp byte [kheap_active], 1
+    jne .fail
+    cmp qword [kheap_free_head], 0
+    je .fail
+    mov rcx, 32
     call kmalloc
     test rax, rax
     jz .fail
     mov r12, rax
-    mov qword [r12], 0xD1A6D1A6
-    cmp qword [r12], 0xD1A6D1A6
+    mov qword [r12], 0xAABBCCDDEEFF0011
+    cmp qword [r12], 0xAABBCCDDEEFF0011
     jne .free_fail
     mov rcx, r12
     call kfree
     xor eax, eax
-    pop r12
     ret
 .free_fail:
     mov rcx, r12
     call kfree
 .fail:
     mov eax, 1
-    pop r12
     ret
 
-; Detailed scheduler/process checks are separate because their ordinary test
-; functions intentionally return only PASS/FAIL.
-diag_process_detailed:
-    push r12
-    push r13
-    push r14
-    call kernel_process_init
-    test eax, eax
-    jnz .init_fail
-    ; Snapshot after initialization. kernel_process_init may legitimately add
-    ; the kernel process to the process list.
-    mov r12, [process_list_count]
-    mov r13, [current_process]
-    test r13, r13
-    jz .current_fail
-    cmp qword [r13 + PR_MAGIC], PROCESS_MAGIC
-    jne .current_fail
-    call process_create
-    test rax, rax
-    jz .create_fail
-    mov r14, rax
-    cmp qword [r14 + PR_PID], 0
-    je .pid_fail
-    cmp qword [r14 + PR_MAGIC], PROCESS_MAGIC
-    jne .magic_fail
-    test qword [r14 + PR_FLAGS], PROCESS_FLAG_ASPACE_READY
-    jz .aspace_fail
-    mov rdi, r14
-    call process_destroy
-    test eax, eax
-    jnz .destroy_fail
-    cmp qword [process_list_count], r12
-    jne .list_fail
-    inc qword [diag_pass_count]
-    lea r9, [msg_diag_process_ok]
-    call draw_text
-    pop r14
-    pop r13
-    pop r12
-    ret
-.init_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_process_init]
-    call draw_text
-    pop r14
-    pop r13
-    pop r12
-    ret
-.current_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_current_process]
-    call draw_text
-    pop r14
-    pop r13
-    pop r12
-    ret
-.create_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_process_create]
-    call draw_text
-    pop r14
-    pop r13
-    pop r12
-    ret
-.pid_fail:
-    mov rdi, r14
-    call process_destroy
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_pid]
-    call draw_text
-    pop r14
-    pop r13
-    pop r12
-    ret
-.magic_fail:
-    mov rdi, r14
-    call process_destroy
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_process_magic]
-    call draw_text
-    pop r14
-    pop r13
-    pop r12
-    ret
-.aspace_fail:
-    mov rdi, r14
-    call process_destroy
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_aspace]
-    call draw_text
-    pop r14
-    pop r13
-    pop r12
-    ret
-.destroy_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_process_destroy]
-    call draw_text
-    pop r14
-    pop r13
-    pop r12
-    ret
-.list_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_process_list]
-    call draw_text
-    pop r14
-    pop r13
-    pop r12
-    ret
 
- diag_scheduler_detailed:
-    call scheduler_disable_preemption
-    call scheduler_test
-    test eax, eax
-    jnz .generic_fail
-    cmp qword [ready_count], 0
-    jne .ready_fail
-    cmp qword [all_thread_count], 0
-    jne .all_fail
+diag_test_thread_invariants:
     mov r12, [current_thread]
     test r12, r12
-    jz .current_fail
+    jz .fail
     cmp qword [r12 + TH_MAGIC], THREAD_MAGIC
-    jne .current_fail
+    jne .fail
+    cmp qword [r12 + TH_CANARY], THREAD_CANARY
+    jne .fail
+    cmp qword [r12 + TH_STATE], THREAD_STATE_RUNNING
+    jne .fail
     cmp qword [scheduler_in_irq], 0
-    jne .irq_fail
-    inc qword [diag_pass_count]
-    lea r9, [msg_diag_sched_ok]
-    call draw_text
+    jne .fail
+    xor eax, eax
     ret
-.ready_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_ready_count]
-    call draw_text
-    ret
-.all_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_all_count]
-    call draw_text
-    ret
-.current_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_current_thread]
-    call draw_text
-    ret
-.irq_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_irq]
-    call draw_text
-    ret
-.generic_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_sched_generic]
-    call draw_text
+.fail:
+    mov eax, 1
     ret
 
-diag_preempt_detailed:
-    push r12
-    push r13
-    sub rsp, 8
-    mov r12, [scheduler_preemptions]
-    mov r13, [lapic_timer_ticks]
-    sti
-    call preemptive_scheduler_test
-    cli
-    test eax, eax
-    jnz .generic_fail
-    cmp byte [lapic_timer_started], 1
-    jne .timer_fail
-    cmp qword [lapic_timer_ticks], r13
-    jbe .ticks_fail
-    cmp qword [scheduler_preemptions], r12
-    jbe .preemptions_fail
+
+diag_test_process_invariants:
+    mov r12, [current_process]
+    test r12, r12
+    jz .fail
+    lea rax, [kernel_process]
+    cmp r12, rax
+    jne .fail
+    cmp qword [r12 + PR_PID], 0
+    jne .fail
+    cmp qword [r12 + PR_MAGIC], PROCESS_MAGIC
+    jne .fail
+    cmp qword [r12 + PR_CANARY], PROCESS_CANARY
+    jne .fail
+    test qword [r12 + PR_FLAGS], PROCESS_FLAG_KERNEL
+    jz .fail
+    mov rax, [r12 + PR_PML4]
+    test rax, rax
+    jz .fail
+    cmp rax, [pml4_ptr]
+    jne .fail
+    cmp qword [process_list_count], 1
+    jne .fail
+    cmp qword [process_list_head], r12
+    jne .fail
+    cmp qword [process_list_tail], r12
+    jne .fail
+    cmp qword [r12 + PR_NEXT], 0
+    jne .fail
+    cmp qword [r12 + PR_PREV], 0
+    jne .fail
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+
+diag_test_lapic:
+    cmp byte [lapic_supported], 1
+    jne .fail
+    cmp qword [lapic_phys_base], 0
+    je .fail
+    cmp qword [lapic_virt_base], 0
+    je .fail
+    cmp byte [lapic_timer_ready], 1
+    jne .fail
+    mov r12, [lapic_virt_base]
+    mov eax, [r12 + LAPIC_SVR]
+    test eax, LAPIC_SVR_ENABLE
+    jz .fail
+    mov eax, [r12 + LAPIC_LVT_TIMER]
+    and eax, 0xFF
+    cmp eax, LAPIC_TIMER_VECTOR
+    jne .fail
+    xor eax, eax
+    ret
+.fail:
+    mov eax, 1
+    ret
+
+
+diag_test_final:
+    ; Final invariant pass.  This is deliberately stricter than "the tests
+    ; returned zero": it checks that the tests did not leave corruption behind.
+    cmp byte [kernel_stage], 9
+    jb .fail_stage
+
     cmp qword [scheduler_in_irq], 0
-    jne .irq_fail
-    cmp qword [preemptive_scheduler_enabled], 0
-    jne .enabled_fail
-    inc qword [diag_pass_count]
-    lea r9, [msg_diag_preempt_ok]
-    call draw_text
-    add rsp, 8
-    pop r13
-    pop r12
+    jne .fail_irq
+
+    ; Cooperative scheduler must not leave an orphaned ready queue.
+    cmp qword [ready_count], 0
+    jne .fail_ready
+    cmp qword [ready_head], 0
+    jne .fail_ready
+    cmp qword [ready_tail], 0
+    jne .fail_ready
+
+    ; The scheduler test environment owns all temporary thread descriptors.
+    cmp qword [all_thread_count], 0
+    jne .fail_all
+    cmp qword [all_thread_head], 0
+    jne .fail_all
+    cmp qword [all_thread_tail], 0
+    jne .fail_all
+
+    ; PMM accounting must remain mathematically sane.
+    mov rax, [boot_info + BootInfo.pmm_free_pages]
+    mov rdx, [boot_info + BootInfo.pmm_total_pages]
+    test rdx, rdx
+    jz .fail_mem
+    cmp rax, rdx
+    ja .fail_mem
+    cmp qword [pmm_cache_count], PMM_CACHE_MAX
+    ja .fail_mem
+
+    ; Every per-order PMM cache count must stay within its hard bound.
+    xor ecx, ecx
+.order_check:
+    cmp ecx, PMM_ORDER_MAX+1
+    jae .process_check
+    cmp qword [pmm_order_counts + rcx*8], PMM_ORDER_CACHE_MAX
+    ja .fail_mem
+    inc ecx
+    jmp .order_check
+
+.process_check:
+    cmp qword [current_process], 0
+    je .fail_process
+    mov r12, [current_process]
+    cmp qword [r12 + PR_MAGIC], PROCESS_MAGIC
+    jne .fail_process
+    cmp qword [r12 + PR_CANARY], PROCESS_CANARY
+    jne .fail_process
+    cmp qword [r12 + PR_PID], 0
+    jne .fail_process
+    cmp qword [process_list_count], 1
+    jb .fail_process
+    cmp qword [process_list_head], 0
+    je .fail_process
+    cmp qword [process_list_tail], 0
+    je .fail_process
+
+    ; Current thread must still be a valid RUNNING kernel context.
+    cmp qword [current_thread], 0
+    je .fail_thread
+    mov r12, [current_thread]
+    cmp qword [r12 + TH_MAGIC], THREAD_MAGIC
+    jne .fail_thread
+    cmp qword [r12 + TH_CANARY], THREAD_CANARY
+    jne .fail_thread
+    cmp qword [r12 + TH_STATE], THREAD_STATE_RUNNING
+    jne .fail_thread
+
+    ; LAPIC remains initialized even though preemption test disables itself.
+    cmp byte [lapic_timer_ready], 1
+    jne .fail_timer
+
+    xor eax, eax
     ret
-.timer_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_timer]
-    call draw_text
-    add rsp, 8
-    pop r13
-    pop r12
+
+.fail_stage:
+    mov eax, 1
     ret
-.ticks_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_ticks]
-    call draw_text
-    add rsp, 8
-    pop r13
-    pop r12
+.fail_irq:
+    mov eax, 2
     ret
-.preemptions_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_preemptions]
-    call draw_text
-    add rsp, 8
-    pop r13
-    pop r12
+.fail_ready:
+    mov eax, 3
     ret
-.enabled_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_preempt_enabled]
-    call draw_text
-    add rsp, 8
-    pop r13
-    pop r12
+.fail_all:
+    mov eax, 4
     ret
-.irq_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_irq]
-    call draw_text
-    add rsp, 8
-    pop r13
-    pop r12
+.fail_mem:
+    mov eax, 5
     ret
-.generic_fail:
-    inc qword [diag_fail_count]
-    lea r9, [msg_diag_detail]
-    call draw_text
-    lea r9, [msg_diag_reason_preempt_generic]
-    call draw_text
-    add rsp, 8
-    pop r13
-    pop r12
+.fail_process:
+    mov eax, 6
     ret
+.fail_thread:
+    mov eax, 7
+    ret
+.fail_timer:
+    mov eax, 8
+    ret
+
 
 test_all:
     push r12
@@ -8559,6 +9430,7 @@ context_switch_test:
 .fail:
     lea r9, [msg_ctxtest_fail]
     call draw_text
+    mov eax, 1
     pop r13
     pop r12
     ret
@@ -9690,21 +10562,43 @@ preemptive_scheduler_test:
 .cleanup3:
     call scheduler_disable_preemption
     mov rdi, [preempt_test_threads + 0]
+    test rdi, rdi
+    jz .cleanup3_b
     call thread_destroy
+    mov qword [preempt_test_threads + 0], 0
+.cleanup3_b:
     mov rdi, [preempt_test_threads + 8]
+    test rdi, rdi
+    jz .cleanup3_c
     call thread_destroy
+    mov qword [preempt_test_threads + 8], 0
+.cleanup3_c:
     mov rdi, [preempt_test_threads + 16]
+    test rdi, rdi
+    jz .cleanup_fail
     call thread_destroy
+    mov qword [preempt_test_threads + 16], 0
+.cleanup_fail:
     jmp .fail
 .cleanup2:
     mov rdi, [preempt_test_threads + 0]
+    test rdi, rdi
+    jz .cleanup2_b
     call thread_destroy
+    mov qword [preempt_test_threads + 0], 0
+.cleanup2_b:
     mov rdi, [preempt_test_threads + 8]
+    test rdi, rdi
+    jz .fail
     call thread_destroy
+    mov qword [preempt_test_threads + 8], 0
     jmp .fail
 .cleanup1:
     mov rdi, [preempt_test_threads + 0]
+    test rdi, rdi
+    jz .fail
     call thread_destroy
+    mov qword [preempt_test_threads + 0], 0
 .fail:
     call scheduler_disable_preemption
     lea r9, [msg_preempt_test_fail]
@@ -11037,6 +11931,38 @@ kernel_entry:
     and rsp, -16
     mov qword [kernel_stack_bottom], THREAD_CANARY
 
+    ; Start the native runtime from a deterministic clean state.  This is
+    ; especially important after a firmware-side diagnostic: those tests must
+    ; never leave process/scheduler objects behind when entering kernel mode.
+    mov qword [thread_next_id], 1
+    mov qword [current_thread], 0
+    mov qword [ready_head], 0
+    mov qword [ready_tail], 0
+    mov qword [ready_count], 0
+    mov qword [all_thread_head], 0
+    mov qword [all_thread_tail], 0
+    mov qword [all_thread_count], 0
+    mov qword [scheduler_return_thread], 0
+    mov qword [preemptive_scheduler_enabled], 0
+    mov qword [scheduler_tick_count], 0
+    mov qword [scheduler_context_switches], 0
+    mov qword [scheduler_preemptions], 0
+
+    mov qword [process_next_pid], 1
+    mov qword [current_process], 0
+    mov qword [process_list_head], 0
+    mov qword [process_list_tail], 0
+    mov qword [process_list_count], 0
+    lea rdi, [kernel_process]
+    xor eax, eax
+    mov ecx, PR_SIZE / 8
+    rep stosq
+
+    lea rdi, [scheduler_test_main]
+    xor eax, eax
+    mov ecx, TH_SIZE / 8
+    rep stosq
+
     lea rsi, [s_kern_gdt]
     call serial_puts
     call gdt_init
@@ -11507,11 +12433,13 @@ pmm_stress_test:
     inc byte [kernel_selftest_failures]
     lea r9, [msg_pmm_stress_fail]
     call draw_text
+    mov eax, 1
     jmp .done
 
 .pass:
     lea r9, [msg_pmm_stress_ok]
     call draw_text
+    xor eax, eax
 
 .done:
     add rsp, 8
@@ -11647,15 +12575,18 @@ vmm_stress_test:
     inc byte [kernel_selftest_failures]
     lea r9, [msg_vmm_stress_fail]
     call draw_text
+    mov eax, 1
     jmp .done
 
 .pass:
     lea r9, [msg_vmm_stress_ok]
     call draw_text
+    xor eax, eax
     jmp .done
 
 .inactive:
     lea r9, [msg_vmm_stress_inactive]
+    mov eax, 1
 
 .done:
     cmp byte [vmm_active], 1
@@ -13034,6 +13965,307 @@ scheduler_preemptions:
 
 ; Diagnostic checkpoint: 1=foundation, 2=threads, 3=process,
 ; 4=scheduler, 5=preemption, 6=stress.  Updated before every phase.
+
+;================ DEEP DIAGNOSTIC DATA =========================
+align 8
+diag_blocked_count:
+    dq 0
+diag_reason_ptr:
+    dq 0
+diag_last_return:
+    dq 0
+diag_probe_value:
+    dq 0
+
+align 8
+diag_gdtr:
+    times 10 db 0
+diag_idtr:
+    times 10 db 0
+
+msg_diag2_header:
+    db 10
+    db "================================================================",10
+    db "                 0xDEAD DEEP KERNEL DIAGNOSTIC",10
+    db "================================================================",10,0
+
+msg_diag2_failed_header:
+    db 10
+    db "======================= FAILED TESTS ===========================",10,0
+
+msg_diag2_no_failed:
+    db 10
+    db "NO FAILED TESTS.",10,0
+
+str_diag2_failure_dot:
+    db ". ",0
+
+str_diag2_problem:
+    db "   Problem: ",0
+
+msg_diag2_environment:
+    db "[ENVIRONMENT SNAPSHOT]",10,0
+
+msg_diag2_phase1:
+    db 10,"[1/6] BOOT / CONSOLE / INPUT FOUNDATION",10,0
+msg_diag2_phase2:
+    db 10,"[2/6] CPU / GDT / TSS / IDT / INTERRUPTS",10,0
+msg_diag2_phase3:
+    db 10,"[3/6] MEMORY / PAGING / PMM / VMM / HHDM",10,0
+msg_diag2_phase4:
+    db 10,"[4/6] HEAP / KMEM / MM API / BUDDY / SLAB / ZONES",10,0
+msg_diag2_phase5:
+    db 10,"[5/6] CONTEXT / THREADS / PROCESSES / SCHEDULER",10,0
+msg_diag2_phase6:
+    db 10,"[6/6] LAPIC / PREEMPTION / STRESS / FINAL INTEGRITY",10,0
+msg_diag2_pre_kernel:
+    db "KERNEL MODE IS NOT ACTIVE: running firmware-safe diagnostics only.",10
+    db "Run 'exit' first, then run 'diag' again for the complete kernel suite.",10,0
+msg_diag2_pre_kernel_footer:
+    db "Firmware-safe diagnostics complete. Kernel-only tests are BLOCKED until",10
+    db "ExitBootServices and native kernel initialization are complete.",10,0
+
+str_diag2_test_start:
+    db "  [TEST 0x",0
+str_diag2_test_mid:
+    db "] ",0
+str_diag2_test_ellipsis:
+    db " ...",0
+
+msg_diag2_pass_one:
+    db "       -> PASS: subsystem completed and post-state is readable.",10,0
+msg_diag2_fail_one:
+    db "       -> FAIL: subsystem returned an error.",10,0
+msg_diag2_exception:
+    db "       -> EXCEPTION: test faulted; diagnostic recovered safely.",10,0
+
+str_diag2_return:
+    db "       Return code: 0x",0
+str_diag2_reason:
+    db "       Why: ",0
+str_diag2_snapshot:
+    db "       State: ",0
+str_d2_ready:
+    db "ready=0x",0
+str_d2_all:
+    db " all=0x",0
+str_d2_irq:
+    db " irq=0x",0
+str_d2_preempts:
+    db " preempts=0x",0
+str_d2_ticks:
+    db " ticks=0x",0
+str_d2_free:
+    db " free_pages=0x",0
+
+str_d2_kernel_stage:
+    db "  kernel_stage=0x",0
+str_d2_vmm_active:
+    db "  vmm_active=0x",0
+str_d2_hh_active:
+    db "  hh_active=0x",0
+str_d2_pmm_free:
+    db "  pmm_free_pages=0x",0
+str_d2_current_thread:
+    db "  current_thread=0x",0
+str_d2_current_process:
+    db "  current_process=0x",0
+str_d2_timer_ticks:
+    db "  timer_ticks=0x",0
+
+str_diag2_boot:
+    db "Boot/UEFI hand-off",0
+str_diag2_stack:
+    db "Kernel + IST stacks",0
+str_diag2_video:
+    db "Framebuffer geometry",0
+str_diag2_console:
+    db "Console cursor/draw/erase",0
+str_diag2_input:
+    db "UEFI keyboard interface",0
+str_diag2_serial:
+    db "Serial diagnostic path",0
+str_diag2_gdt:
+    db "GDT + segment selectors",0
+str_diag2_tss:
+    db "TSS + kernel/IST stacks",0
+str_diag2_idt:
+    db "IDT + first 32 exception gates",0
+str_diag2_interrupt_state:
+    db "Interrupt/scheduler IRQ state",0
+str_diag2_memory_state:
+    db "PMM metadata/counters",0
+str_diag2_paging:
+    db "CR0/CR4/CR3 + VMM activation",0
+str_diag2_pmm:
+    db "PMM alloc/zero/write/free",0
+str_diag2_vmm:
+    db "VMM map/write/translate/unmap",0
+str_diag2_hhdm:
+    db "Higher-half direct mapping",0
+str_diag2_highmap:
+    db "Higher-half mapping command path",0
+str_diag2_heap:
+    db "Kernel heap init/alloc/free",0
+str_diag2_heap_test:
+    db "Kernel heap full self-test",0
+str_diag2_kmem:
+    db "KMEM API",0
+str_diag2_mmflags:
+    db "MM allocation flags",0
+str_diag2_buddy:
+    db "Buddy allocator",0
+str_diag2_buddy_arena:
+    db "Buddy arena",0
+str_diag2_buddy_stress:
+    db "Buddy stress",0
+str_diag2_buddy_pmm:
+    db "Buddy PMM",0
+str_diag2_zones:
+    db "DMA / memory zones",0
+str_diag2_slab:
+    db "Slab allocator",0
+str_diag2_mmapi:
+    db "Unified MM API",0
+str_diag2_context:
+    db "Context switching",0
+str_diag2_thread:
+    db "Thread lifecycle",0
+str_diag2_thread_invariants:
+    db "Thread descriptor invariants",0
+str_diag2_process:
+    db "Process lifecycle",0
+str_diag2_process_invariants:
+    db "Process descriptor invariants",0
+str_diag2_scheduler:
+    db "Cooperative scheduler",0
+str_diag2_preempt:
+    db "Preemptive scheduler",0
+str_diag2_lapic:
+    db "Local APIC timer state",0
+str_diag2_pmm_stress:
+    db "PMM stress",0
+str_diag2_vmm_stress:
+    db "VMM stress",0
+str_diag2_final:
+    db "Final kernel integrity",0
+
+reason_diag2_boot:
+    db "required firmware/kernel hand-off state is missing",10,0
+reason_diag2_stack:
+    db "kernel or IST stack is misaligned, or the kernel stack canary is damaged",10,0
+reason_diag2_video:
+    db "framebuffer pointer/geometry/stride is invalid or disagrees with BootInfo",10,0
+reason_diag2_console:
+    db "cursor state is outside the framebuffer or XOR draw/erase did not round-trip",10,0
+reason_diag2_input:
+    db "ConIn or its ReadKeyStroke interface is NULL",10,0
+reason_diag2_serial:
+    db "serial output path could not be exercised",10,0
+reason_diag2_gdt:
+    db "GDTR, GDT base/limit, or kernel data/code selectors are invalid",10,0
+reason_diag2_tss:
+    db "TR is not the expected TSS selector or RSP0/IST1 is invalid",10,0
+reason_diag2_idt:
+    db "IDTR is wrong or one of the first 32 exception gates is not present",10,0
+reason_diag2_interrupt_state:
+    db "diagnostic left scheduler_in_irq set or interrupts unexpectedly enabled",10,0
+reason_diag2_memory_state:
+    db "PMM bitmap/counters are missing or free pages exceed total pages",10,0
+reason_diag2_paging:
+    db "paging is not active, CR3 does not match the kernel PML4, or VMM translation failed",10,0
+reason_diag2_pmm:
+    db "PMM could not allocate, zero, preserve a test pattern, or restore its free-page count",10,0
+reason_diag2_vmm:
+    db "VMM test address was already mapped, mapping failed, data was corrupted, or translation was wrong",10,0
+reason_diag2_hhdm:
+    db "higher-half map is inactive/unverified or physical<->virtual round-trip failed",10,0
+reason_diag2_highmap:
+    db "highmap could not create the higher-half mapping or translate its test page",10,0
+reason_diag2_heap:
+    db "kernel heap could not initialize, allocate, preserve data, or free cleanly",10,0
+reason_diag2_heap_test:
+    db "kernel heap's complete self-test returned failure",10,0
+reason_diag2_kmem:
+    db "KMEM allocator self-test returned failure",10,0
+reason_diag2_mmflags:
+    db "MM allocation flag semantics self-test returned failure",10,0
+reason_diag2_buddy:
+    db "Buddy allocator self-test returned failure",10,0
+reason_diag2_buddy_arena:
+    db "Buddy arena initialization/allocation/free self-test returned failure",10,0
+reason_diag2_buddy_stress:
+    db "Buddy stress test detected an allocation/coalescing/corruption failure",10,0
+reason_diag2_buddy_pmm:
+    db "Buddy-PMM integration self-test returned failure",10,0
+reason_diag2_zones:
+    db "DMA/DMA32 zone constraints self-test returned failure",10,0
+reason_diag2_slab:
+    db "Slab allocator self-test returned failure",10,0
+reason_diag2_mmapi:
+    db "unified MM API allocation/translation/free test returned failure",10,0
+reason_diag2_context:
+    db "fresh context entry or suspended-context resume did not occur exactly as expected",10,0
+reason_diag2_thread:
+    db "thread create/destroy/lifecycle test returned failure",10,0
+reason_diag2_thread_invariants:
+    db "current thread is NULL, corrupt, dead, not RUNNING, or scheduler IRQ state is dirty",10,0
+reason_diag2_process:
+    db "process PID/address-space/lifecycle test returned failure",10,0
+reason_diag2_process_invariants:
+    db "current process magic/canary/PID/kernel flag/PML4 invariant failed",10,0
+reason_diag2_scheduler:
+    db "cooperative round-robin scheduler self-test returned failure",10,0
+reason_diag2_preempt:
+    db "preemptive scheduler self-test returned failure",10,0
+reason_diag2_lapic:
+    db "Local APIC support/base/timer/SVR/vector state is invalid",10,0
+reason_diag2_pmm_stress:
+    db "PMM stress test detected an allocation or cleanup failure",10,0
+reason_diag2_vmm_stress:
+    db "VMM stress test detected mapping, memory, translation, or cleanup failure",10,0
+reason_diag2_final:
+    db "final IRQ, allocator, current-thread, or current-process invariant failed",10,0
+
+reason_diag2_boot_hal:
+    db "UEFI HAL ready flag is not set",10,0
+reason_diag2_boot_bs:
+    db "Boot Services table pointer is NULL",10,0
+reason_diag2_boot_image:
+    db "image handle is NULL",10,0
+reason_diag2_boot_conin:
+    db "ConIn protocol pointer is NULL",10,0
+reason_diag2_boot_info:
+    db "BootInfo structure is NULL",10,0
+reason_diag2_boot_map:
+    db "firmware memory map pointer is NULL",10,0
+reason_diag2_boot_mapsize:
+    db "firmware memory map size is zero",10,0
+reason_diag2_boot_desc:
+    db "EFI memory descriptor size is smaller than the required 40 bytes",10,0
+reason_diag2_boot_bitmap:
+    db "PMM bitmap pointer is NULL",10,0
+reason_diag2_boot_pages:
+    db "PMM reports zero total pages",10,0
+reason_diag2_boot_mm:
+    db "unified memory manager ready flag is not set",10,0
+
+s_diag_serial_probe:
+    db "0xDEAD DIAG: serial path alive",13,10,0
+
+msg_diag2_summary:
+    db 10,"==================== DIAGNOSTIC SUMMARY ====================",10,0
+msg_diag2_pass:
+    db "  PASS    : 0x",0
+msg_diag2_fail:
+    db "  FAIL    : 0x",0
+msg_diag2_blocked:
+    db "  BLOCKED : 0x",0
+msg_diag2_clean:
+    db "  STATUS  : CLEAN - every requested diagnostic completed.",10,0
+msg_diag2_dirty:
+    db "  STATUS  : FAILURE - read the Why/State lines above.",10,0
+
 align 8
 diag_phase:
     dq 0
@@ -13065,6 +14297,18 @@ diag_pass_count:
     dq 0
 diag_fail_count:
     dq 0
+diag_failed_list_count:
+    dq 0
+
+; Every failed test is kept as TWO TEXT POINTERS:
+;   [name]   = what failed
+;   [reason] = why it failed
+; The final report prints these in plain human-readable form.
+align 8
+diag_failed_names:
+    times 64 dq 0
+diag_failed_reasons:
+    times 64 dq 0
 
 align 8
 panic_frame_ptr:
@@ -13230,4 +14474,3 @@ pmm_bitmap:
 align 16
 buddy_static_pool:
     times (2 * BUDDY_STATIC_BLOCK_SIZE) db 0
-
