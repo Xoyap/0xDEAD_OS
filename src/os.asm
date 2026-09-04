@@ -5819,50 +5819,62 @@ buddy_pmm_test:
     lea r9, [msg_bpmm_v1]
     call draw_text
 
+    mov qword [buddy_pmm_fail_stage], 0
     call buddy_pmm_init
     test eax, eax
-    jnz .fail
+    jnz .fail_stage_init
 
     call buddy_pmm_reset
     test eax, eax
+    mov qword [buddy_pmm_fail_stage], 1
     jnz .fail
 
     ; 4 x order-0
     mov rcx, 0
     call buddy_pmm_alloc
     test rax, rax
+    mov qword [buddy_pmm_fail_stage], 2
     jz .fail
     mov r12, rax
 
     mov rcx, 0
     call buddy_pmm_alloc
     test rax, rax
+    mov qword [buddy_pmm_fail_stage], 3
     jz .fail
     mov r13, rax
 
     mov rcx, 0
     call buddy_pmm_alloc
     test rax, rax
+    mov qword [buddy_pmm_fail_stage], 4
     jz .fail
     mov r14, rax
 
     mov rcx, 0
     call buddy_pmm_alloc
     test rax, rax
+    mov qword [buddy_pmm_fail_stage], 5
     jz .fail
     mov r15, rax
 
     cmp r12, r13
+    mov qword [buddy_pmm_fail_stage], 6
     je .fail
     cmp r12, r14
+    mov qword [buddy_pmm_fail_stage], 7
     je .fail
     cmp r12, r15
+    mov qword [buddy_pmm_fail_stage], 8
     je .fail
     cmp r13, r14
+    mov qword [buddy_pmm_fail_stage], 9
     je .fail
     cmp r13, r15
+    mov qword [buddy_pmm_fail_stage], 10
     je .fail
     cmp r14, r15
+    mov qword [buddy_pmm_fail_stage], 11
     je .fail
 
     mov qword [r12], 0x10
@@ -5871,12 +5883,16 @@ buddy_pmm_test:
     mov qword [r15], 0x13
 
     cmp qword [r12], 0x10
+    mov qword [buddy_pmm_fail_stage], 12
     jne .fail
     cmp qword [r13], 0x11
+    mov qword [buddy_pmm_fail_stage], 13
     jne .fail
     cmp qword [r14], 0x12
+    mov qword [buddy_pmm_fail_stage], 14
     jne .fail
     cmp qword [r15], 0x13
+    mov qword [buddy_pmm_fail_stage], 15
     jne .fail
 
     mov rcx, r13
@@ -5899,24 +5915,29 @@ buddy_pmm_test:
     mov rcx, 1
     call buddy_pmm_alloc
     test rax, rax
+    mov qword [buddy_pmm_fail_stage], 16
     jz .fail
     mov r12, rax
 
     mov rcx, 1
     call buddy_pmm_alloc
     test rax, rax
+    mov qword [buddy_pmm_fail_stage], 17
     jz .fail
     mov r13, rax
 
     cmp r12, r13
+    mov qword [buddy_pmm_fail_stage], 18
     je .fail
 
     mov qword [r12], 0x20
     mov qword [r13], 0x21
 
     cmp qword [r12], 0x20
+    mov qword [buddy_pmm_fail_stage], 19
     jne .fail
     cmp qword [r13], 0x21
+    mov qword [buddy_pmm_fail_stage], 20
     jne .fail
 
     mov rcx, r13
@@ -5931,11 +5952,13 @@ buddy_pmm_test:
     mov rcx, 2
     call buddy_pmm_alloc
     test rax, rax
+    mov qword [buddy_pmm_fail_stage], 21
     jz .fail
     mov r12, rax
 
     mov qword [r12], 0x30
     cmp qword [r12], 0x30
+    mov qword [buddy_pmm_fail_stage], 22
     jne .fail
 
     mov rcx, r12
@@ -5946,11 +5969,13 @@ buddy_pmm_test:
     mov rcx, 4
     call buddy_pmm_alloc
     test rax, rax
+    mov qword [buddy_pmm_fail_stage], 23
     jz .fail
     mov r12, rax
 
     mov qword [r12], 0x40
     cmp qword [r12], 0x40
+    mov qword [buddy_pmm_fail_stage], 24
     jne .fail
 
     mov rcx, r12
@@ -5961,24 +5986,29 @@ buddy_pmm_test:
     mov rcx, 3
     call buddy_pmm_alloc
     test rax, rax
+    mov qword [buddy_pmm_fail_stage], 25
     jz .fail
     mov r12, rax
 
     mov rcx, 3
     call buddy_pmm_alloc
     test rax, rax
+    mov qword [buddy_pmm_fail_stage], 26
     jz .fail
     mov r13, rax
 
     cmp r12, r13
+    mov qword [buddy_pmm_fail_stage], 27
     je .fail
 
     mov qword [r12], 0x50
     mov qword [r13], 0x51
 
     cmp qword [r12], 0x50
+    mov qword [buddy_pmm_fail_stage], 28
     jne .fail
     cmp qword [r13], 0x51
+    mov qword [buddy_pmm_fail_stage], 29
     jne .fail
 
     mov rcx, r13
@@ -6000,18 +6030,25 @@ buddy_pmm_test:
     pop r12
     ret
 
+.fail_stage_init:
+    mov qword [buddy_pmm_fail_stage], 1
+    jmp .fail
+
 .fail:
     call buddy_pmm_reset
     lea r9, [msg_bpmm_fail]
     call draw_text
+    mov eax, [buddy_pmm_fail_stage]
+    test eax, eax
+    jnz .fail_code_ready
     mov eax, 1
+.fail_code_ready:
 
     pop r15
     pop r14
     pop r13
     pop r12
     ret
-
 zonetest:
     push r12
     push r13
@@ -6022,14 +6059,14 @@ zonetest:
 
     call buddy_pmm_init
     test eax, eax
-    jnz .fail
+    jnz .fail_init
 
     ; Normal allocation, order 2
     mov rcx, 2
     xor rdx, rdx
     call pmm_alloc_order_flags
     test rax, rax
-    jz .fail
+    jz .fail_normal_alloc
     mov r12, rax
 
     mov rcx, r12
@@ -6050,12 +6087,12 @@ zonetest:
     mov rdx, MM_FLAG_DMA32
     call pmm_alloc_order_flags
     test rax, rax
-    jz .fail
+    jz .fail_dma32_alloc
     mov r12, rax
 
     mov r13, [zone_dma32_limit_val]
     cmp r12, r13
-    jae .fail
+    jae .fail_dma32_limit
 
     mov rcx, r12
     call phys_to_virt
@@ -6075,12 +6112,12 @@ zonetest:
     mov rdx, MM_FLAG_DMA
     call pmm_alloc_order_flags
     test rax, rax
-    jz .fail
+    jz .fail_dma_alloc
     mov r12, rax
 
     mov r13, [zone_dma_limit_val]
     cmp r12, r13
-    jae .fail
+    jae .fail_dma_limit
 
     mov rcx, r12
     call phys_to_virt
@@ -6108,24 +6145,46 @@ zonetest:
     mov rcx, r12
     mov rdx, 2
     call pmm_free_order_flags
+    mov eax, 7
     jmp .fail
 
 .free_dma32_fail:
     mov rcx, r12
     mov rdx, 2
     call pmm_free_order_flags
+    mov eax, 8
     jmp .fail
 
 .free_dma_fail:
     mov rcx, r12
     xor edx, edx
     call pmm_free_order_flags
+    mov eax, 9
+    jmp .fail
+
+.fail_init:
+    mov eax, 1
+    jmp .fail
+.fail_normal_alloc:
+    mov eax, 2
+    jmp .fail
+.fail_dma32_alloc:
+    mov eax, 3
+    jmp .fail
+.fail_dma32_limit:
+    mov eax, 4
+    jmp .fail
+.fail_dma_alloc:
+    mov eax, 5
+    jmp .fail
+.fail_dma_limit:
+    mov eax, 6
     jmp .fail
 
 .fail:
     lea r9, [msg_zonetest_fail]
     call draw_text
-    mov eax, 1
+    ; EAX already contains the stage code.
 
     pop r14
     pop r13
@@ -7981,15 +8040,12 @@ kernel_diagnostic:
     lea rdx, [reason_diag2_scheduler]
     call diag_run_one
 
-    ; diag itself runs with IF=0 for deterministic exception recovery.
-    ; The preemptive scheduler test requires real LAPIC interrupts, so allow
-    ; interrupts only while this one test is executing.
-    sti
+    ; Keep IF=0 during preemptive-scheduler setup.  thread_bootstrap enables
+    ; interrupts only after scheduler_start has saved the shell context.
     lea rdi, [str_diag2_preempt]
     lea rsi, [preemptive_scheduler_test]
     lea rdx, [reason_diag2_preempt]
     call diag_run_one
-    cli
 
     lea rdi, [str_diag2_lapic]
     lea rsi, [diag_test_lapic]
@@ -10132,6 +10188,13 @@ thread_bootstrap:
     jz .fault
     cmp qword [r12 + TH_MAGIC], THREAD_MAGIC
     jne .fault
+
+    ; Preemptive workers start from IF=0.  Enable interrupts only after the
+    ; initial cooperative switch has saved the shell context.
+    cmp qword [preemptive_scheduler_enabled], 1
+    jne .keep_if
+    sti
+.keep_if:
     mov qword [r12 + TH_STATE], THREAD_STATE_RUNNING
     mov rdi, [r12 + TH_ARG]
     call [r12 + TH_ENTRY]
@@ -10490,6 +10553,7 @@ preemptive_scheduler_test:
     call scheduler_main_init
     test eax, eax
     jnz .fail
+    mov qword [preempt_test_fail_stage], 0
     mov qword [preempt_test_total], 0
     mov qword [preempt_test_counts + 0], 0
     mov qword [preempt_test_counts + 8], 0
@@ -10523,17 +10587,19 @@ preemptive_scheduler_test:
     call scheduler_start
     call scheduler_disable_preemption
 
+    ; Distinguish scheduler progress failures so diag output identifies the
+    ; exact post-dispatch condition instead of only returning generic FAIL.
+    cmp qword [preempt_test_counts + 0], PREEMPT_TEST_ROUNDS
+    jne .cleanup3_count0
+    cmp qword [preempt_test_counts + 8], PREEMPT_TEST_ROUNDS
+    jne .cleanup3_count1
+    cmp qword [preempt_test_counts + 16], PREEMPT_TEST_ROUNDS
+    jne .cleanup3_count2
+    cmp qword [scheduler_preemptions], 0
+    je .cleanup3_no_preempt
+
     ; Total iteration count is informational. Preemption may occur between
     ; iterations; correctness is established by every worker reaching its rounds.
-    cmp qword [preempt_test_counts + 0], PREEMPT_TEST_ROUNDS
-    jne .cleanup3
-    cmp qword [preempt_test_counts + 8], PREEMPT_TEST_ROUNDS
-    jne .cleanup3
-    cmp qword [preempt_test_counts + 16], PREEMPT_TEST_ROUNDS
-    jne .cleanup3
-    cmp qword [scheduler_preemptions], 0
-    je .cleanup3
-
     mov r12, [preempt_test_threads + 0]
     mov rdi, r12
     call thread_destroy
@@ -10559,6 +10625,17 @@ preemptive_scheduler_test:
     pop r12
     ret
 
+.cleanup3_count0:
+    mov qword [preempt_test_fail_stage], 2
+    jmp .cleanup3
+.cleanup3_count1:
+    mov qword [preempt_test_fail_stage], 3
+    jmp .cleanup3
+.cleanup3_count2:
+    mov qword [preempt_test_fail_stage], 4
+    jmp .cleanup3
+.cleanup3_no_preempt:
+    mov qword [preempt_test_fail_stage], 5
 .cleanup3:
     call scheduler_disable_preemption
     mov rdi, [preempt_test_threads + 0]
@@ -10603,7 +10680,11 @@ preemptive_scheduler_test:
     call scheduler_disable_preemption
     lea r9, [msg_preempt_test_fail]
     call draw_text
+    mov eax, [preempt_test_fail_stage]
+    test eax, eax
+    jnz .fail_code_ready
     mov eax, 1
+.fail_code_ready:
     add rsp, 8
     pop r14
     pop r13
@@ -13468,6 +13549,9 @@ msg_bpmm_ok:
 msg_bpmm_fail:
     db "Buddy PMM: FAIL",10,0
 
+buddy_pmm_fail_stage:
+    dq 0
+
 buddy_pmm_active:
     db 0
 
@@ -14362,6 +14446,9 @@ preempt_test_args:
     dq 0, 1, 2
 preempt_test_counts:
     times 3 dq 0
+preempt_test_fail_stage:
+    dq 0
+
 preempt_test_total:
     dq 0
 
