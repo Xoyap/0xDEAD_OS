@@ -5771,12 +5771,11 @@ buddy_pmm_init:
     mov byte [buddy_pmm_active], 1
 
 .ok:
-    xor eax, eax
-
     pop rdx
     pop rax
     pop rcx
     pop rdi
+    xor eax, eax
     ret
 
 buddy_pmm_reset:
@@ -5802,12 +5801,11 @@ buddy_pmm_reset:
     mov byte [buddy_pmm_active], 1
 
 .done:
-    xor eax, eax
-
     pop rdx
     pop rax
     pop rcx
     pop rdi
+    xor eax, eax
     ret
 
 buddy_pmm_test:
@@ -6019,7 +6017,22 @@ buddy_pmm_test:
     mov rdx, 3
     call buddy_pmm_free
 
-    call buddy_pmm_reset
+    ; After freeing every allocation, the allocator itself must have coalesced
+    ; the complete 4 MiB arena back into one order-9 block. Do NOT reset here:
+    ; resetting would erase the very merge behavior this test is meant to prove.
+    lea rdi, [buddy_pmm_heads]
+    mov rax, [rdi + BUDDY_PMM_ORDER*8]
+    cmp rax, [buddy_pmm_pool_phys]
+    jne .fail_stage_final_head
+    xor ecx, ecx
+.final_free_lists:
+    cmp ecx, BUDDY_PMM_ORDER
+    jae .final_free_lists_done
+    cmp qword [rdi + rcx*8], 0
+    jne .fail_stage_final_head
+    inc ecx
+    jmp .final_free_lists
+.final_free_lists_done:
     lea r9, [msg_bpmm_ok]
     call draw_text
     xor eax, eax
@@ -6029,6 +6042,10 @@ buddy_pmm_test:
     pop r13
     pop r12
     ret
+
+.fail_stage_final_head:
+    mov qword [buddy_pmm_fail_stage], 30
+    jmp .fail
 
 .fail_stage_init:
     mov qword [buddy_pmm_fail_stage], 1
@@ -6043,6 +6060,29 @@ buddy_pmm_test:
     jnz .fail_code_ready
     mov eax, 1
 .fail_code_ready:
+    push rax
+    lea r9, [str_bpmm_fail_stage]
+    call draw_text
+    mov rcx, [buddy_pmm_fail_stage]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+    lea r9, [str_bpmm_fail_heads]
+    call draw_text
+    xor r12d, r12d
+.bpmm_dump_heads:
+    cmp r12d, BUDDY_PMM_ORDER + 1
+    jae .bpmm_dump_done
+    mov rcx, [buddy_pmm_heads + r12*8]
+    call print_hex64
+    mov r9b, KEY_SPACE
+    call console_putc
+    inc r12d
+    jmp .bpmm_dump_heads
+.bpmm_dump_done:
+    mov r9b, CHAR_LF
+    call console_putc
+    pop rax
 
     pop r15
     pop r14
@@ -8458,63 +8498,157 @@ diag_print_dec:
 ; remains available in the per-test output above when needed.
 ;-----------------------------------------------------------------------
 diag_print_failed_tests:
+    ; Final report only. Failure recording and test logic are untouched.
+    ; Keep index/count in memory so console helpers cannot corrupt them.
+    push rbx
     push r12
     push r13
     push r14
     push r15
+    sub rsp, 16
 
-    mov r13, [diag_failed_list_count]
-    test r13, r13
-    jz .none
+    mov rax, [diag_failed_list_count]
+    mov [rsp], rax
+    xor eax, eax
+    mov [rsp + 8], rax
+
+    cmp qword [rsp], 0
+    je .none
 
     lea r9, [msg_diag2_failed_header]
     call draw_text
 
-    xor r12d, r12d
-
 .loop:
-    cmp r12, r13
+    mov rax, [rsp + 8]
+    cmp rax, [rsp]
     jae .done
 
-    mov rax, r12
+    mov rax, [rsp + 8]
     inc rax
     call diag_print_dec
-
     lea r9, [str_diag2_failure_dot]
     call draw_text
 
-    lea r14, [diag_failed_names]
-    mov rax, r12
+    mov rax, [rsp + 8]
     shl rax, 3
-    mov r9, [r14 + rax]
+    lea rbx, [diag_failed_names]
+    mov r9, [rbx + rax]
     call draw_text
     mov r9b, CHAR_LF
     call console_putc
 
     lea r9, [str_diag2_problem]
     call draw_text
-
-    ; draw_text/console_putc are free to clobber RAX. Recompute the
-    ; array offset before reading the reason pointer; otherwise every
-    ; failure can incorrectly display the same reason.
-    mov rax, r12
+    mov rax, [rsp + 8]
     shl rax, 3
-    lea r14, [diag_failed_reasons]
-    mov r9, [r14 + rax]
+    lea rbx, [diag_failed_reasons]
+    mov r9, [rbx + rax]
     call draw_text
     mov r9b, CHAR_LF
     call console_putc
+
+    ; Determine which diagnostic block belongs to this failed test.
+    mov rax, [rsp + 8]
+    shl rax, 3
+    lea rbx, [diag_failed_names]
+    mov r12, [rbx + rax]
+
+    lea rax, [str_diag2_buddy_pmm]
+    cmp r12, rax
+    jne .check_preempt
+
+    lea r9, [str_diag2_debug_stage]
+    call draw_text
+    mov rcx, [buddy_pmm_fail_stage]
+    call print_hex64
     mov r9b, CHAR_LF
     call console_putc
 
-    inc r12
+    lea r9, [str_diag2_debug_pool]
+    call draw_text
+    mov rcx, [buddy_pmm_pool_phys]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_diag2_debug_heads]
+    call draw_text
+    xor r14d, r14d
+.buddy_heads:
+    cmp r14d, BUDDY_PMM_ORDER + 1
+    jae .buddy_heads_done
+    mov rcx, [buddy_pmm_heads + r14*8]
+    call print_hex64
+    mov r9b, KEY_SPACE
+    call console_putc
+    inc r14d
+    jmp .buddy_heads
+.buddy_heads_done:
+    mov r9b, CHAR_LF
+    call console_putc
+    jmp .next
+
+.check_preempt:
+    lea rax, [str_diag2_preempt]
+    cmp r12, rax
+    jne .next
+
+    lea r9, [str_diag2_debug_stage]
+    call draw_text
+    mov rcx, [preempt_test_fail_stage]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_diag2_debug_ticks]
+    call draw_text
+    mov rcx, [lapic_timer_ticks]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_diag2_debug_preempts]
+    call draw_text
+    mov rcx, [scheduler_preemptions]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_diag2_debug_switches]
+    call draw_text
+    mov rcx, [scheduler_context_switches]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+    lea r9, [str_diag2_debug_workers]
+    call draw_text
+    mov rcx, [preempt_test_counts + 0]
+    call print_hex64
+    mov r9b, KEY_SPACE
+    call console_putc
+    mov rcx, [preempt_test_counts + 8]
+    call print_hex64
+    mov r9b, KEY_SPACE
+    call console_putc
+    mov rcx, [preempt_test_counts + 16]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+
+.next:
+    mov r9b, CHAR_LF
+    call console_putc
+    inc qword [rsp + 8]
     jmp .loop
 
 .done:
+    add rsp, 16
     pop r15
     pop r14
     pop r13
     pop r12
+    pop rbx
     ret
 
 .none:
@@ -9750,6 +9884,13 @@ thread_create:
     call context_init
     mov [r12 + TH_CTX + CTX_R12], r12
 
+    ; Preemptive test workers must enter with hardware interrupts enabled.
+    ; The diagnostic command itself runs with IF=0, so context_init() would
+    ; otherwise save IF=0 and the worker could remain interrupt-disabled until
+    ; thread_bootstrap. Make the first cooperative dispatch unambiguously
+    ; interruptible; thread_bootstrap.STI remains as a defensive idempotent step.
+    or qword [r12 + TH_CTX + CTX_RFLAGS], 0x200
+
     ; Synthetic ring-0 interrupt frame for a first preemptive dispatch.
     lea rax, [rbx - PREEMPT_FRAME_BYTES]
     mov [r12 + TH_IRQ_RSP], rax
@@ -9933,6 +10074,8 @@ scheduler_timer_tick:
     jz .same
     cmp qword [r12 + TH_MAGIC], THREAD_MAGIC
     jne .same
+    cmp qword [r12 + TH_STATE], THREAD_STATE_RUNNING
+    jne .same
 
     mov [r12 + TH_IRQ_RSP], r15
     or qword [r12 + TH_FLAGS], THREAD_FLAG_STARTED
@@ -10081,6 +10224,13 @@ scheduler_yield:
 
 ; Current thread has returned from its entry point. Never returns.
 scheduler_thread_exit:
+    ; A returning preemptive worker must become DEAD atomically with respect to
+    ; the timer. Otherwise an IRQ can observe RUNNING/READY during the return
+    ; window and enqueue a thread that is already leaving the scheduler.
+    cmp qword [preemptive_scheduler_enabled], 1
+    jne .exit_if_safe
+    cli
+.exit_if_safe:
     mov r12, [current_thread]
     test r12, r12
     jz .halt
@@ -10189,13 +10339,13 @@ thread_bootstrap:
     cmp qword [r12 + TH_MAGIC], THREAD_MAGIC
     jne .fault
 
-    ; Preemptive workers start from IF=0.  Enable interrupts only after the
-    ; initial cooperative switch has saved the shell context.
+    ; Publish RUNNING before enabling interrupts. This closes the window in
+    ; which the timer could observe a freshly-dispatched worker as READY.
+    mov qword [r12 + TH_STATE], THREAD_STATE_RUNNING
     cmp qword [preemptive_scheduler_enabled], 1
     jne .keep_if
     sti
 .keep_if:
-    mov qword [r12 + TH_STATE], THREAD_STATE_RUNNING
     mov rdi, [r12 + TH_ARG]
     call [r12 + TH_ENTRY]
     jmp scheduler_thread_exit
@@ -10549,10 +10699,19 @@ preemptive_scheduler_test:
     sub rsp, 8
 
     call scheduler_disable_preemption
+
+    ; This test is meaningful only when the LAPIC timer is actually running.
+    ; Do not silently accept a scheduler with no interrupt source.
+    cmp byte [lapic_timer_ready], 1
+    jne .fail_stage_timer_not_ready
+    cmp byte [lapic_timer_started], 1
+    jne .fail_stage_timer_not_started
+
     lea rdi, [scheduler_test_main]
     call scheduler_main_init
     test eax, eax
-    jnz .fail
+    jnz .fail_stage_main_init
+
     mov qword [preempt_test_fail_stage], 0
     mov qword [preempt_test_total], 0
     mov qword [preempt_test_counts + 0], 0
@@ -10562,11 +10721,13 @@ preemptive_scheduler_test:
     mov qword [preempt_test_threads + 8], 0
     mov qword [preempt_test_threads + 16], 0
 
+    mov r12, [lapic_timer_ticks]
+
     lea rdi, [preempt_test_worker]
     lea rsi, [preempt_test_args + 0]
     call thread_create
     test rax, rax
-    jz .fail
+    jz .fail_stage_create0
     mov [preempt_test_threads + 0], rax
 
     lea rdi, [preempt_test_worker]
@@ -10583,38 +10744,70 @@ preemptive_scheduler_test:
     jz .cleanup2
     mov [preempt_test_threads + 16], rax
 
+    ; thread_create was called while diagnostic IF=0. Explicitly make every
+    ; initial cooperative context interruptible.
+    mov rdi, [preempt_test_threads + 0]
+    or qword [rdi + TH_CTX + CTX_RFLAGS], 0x200
+    mov rdi, [preempt_test_threads + 8]
+    or qword [rdi + TH_CTX + CTX_RFLAGS], 0x200
+    mov rdi, [preempt_test_threads + 16]
+    or qword [rdi + TH_CTX + CTX_RFLAGS], 0x200
+
     call scheduler_enable_preemption
+
+    ; Keep the shell/main context interrupt-disabled while scheduler_start
+    ; performs its first cooperative switch. The worker's saved context has
+    ; IF=1, so interrupts become enabled exactly when the worker starts. This
+    ; removes the window in which the timer could interrupt scheduler_start
+    ; while main is still being installed as scheduler_return_thread.
+    cli
     call scheduler_start
+    cli
     call scheduler_disable_preemption
 
-    ; Distinguish scheduler progress failures so diag output identifies the
-    ; exact post-dispatch condition instead of only returning generic FAIL.
+    ; Timer must have delivered real interrupts during the test.
+    mov rax, [lapic_timer_ticks]
+    cmp rax, r12
+    jbe .cleanup3_no_ticks
+
     cmp qword [preempt_test_counts + 0], PREEMPT_TEST_ROUNDS
     jne .cleanup3_count0
     cmp qword [preempt_test_counts + 8], PREEMPT_TEST_ROUNDS
     jne .cleanup3_count1
     cmp qword [preempt_test_counts + 16], PREEMPT_TEST_ROUNDS
     jne .cleanup3_count2
+
     cmp qword [scheduler_preemptions], 0
     je .cleanup3_no_preempt
 
-    ; Total iteration count is informational. Preemption may occur between
-    ; iterations; correctness is established by every worker reaching its rounds.
-    mov r12, [preempt_test_threads + 0]
-    mov rdi, r12
+    cmp qword [scheduler_context_switches], 0
+    je .cleanup3_no_switch
+
+    ; The scheduler must have returned control to its registered main context.
+    lea rax, [scheduler_test_main]
+    cmp qword [current_thread], rax
+    jne .cleanup3_bad_current
+
+    mov rdi, [preempt_test_threads + 0]
     call thread_destroy
     test eax, eax
-    jnz .fail
-    mov r12, [preempt_test_threads + 8]
-    mov rdi, r12
+    jnz .fail_after_cleanup
+    mov qword [preempt_test_threads + 0], 0
+    mov rdi, [preempt_test_threads + 8]
     call thread_destroy
     test eax, eax
-    jnz .fail
-    mov r12, [preempt_test_threads + 16]
-    mov rdi, r12
+    jnz .fail_after_cleanup
+    mov qword [preempt_test_threads + 8], 0
+    mov rdi, [preempt_test_threads + 16]
     call thread_destroy
     test eax, eax
-    jnz .fail
+    jnz .fail_after_cleanup
+    mov qword [preempt_test_threads + 16], 0
+
+    cmp qword [all_thread_count], 0
+    jne .fail_stage_cleanup_count
+    cmp qword [ready_count], 0
+    jne .fail_stage_cleanup_ready
 
     lea r9, [msg_preempt_test_ok]
     call draw_text
@@ -10625,57 +10818,93 @@ preemptive_scheduler_test:
     pop r12
     ret
 
-.cleanup3_count0:
+.fail_stage_timer_not_ready:
+    mov qword [preempt_test_fail_stage], 1
+    jmp .fail
+.fail_stage_timer_not_started:
     mov qword [preempt_test_fail_stage], 2
+    jmp .fail
+.fail_stage_main_init:
+    mov qword [preempt_test_fail_stage], 3
+    jmp .fail
+.fail_stage_create0:
+    mov qword [preempt_test_fail_stage], 4
+    jmp .fail
+.cleanup3_no_ticks:
+    mov qword [preempt_test_fail_stage], 5
+    jmp .cleanup3
+.cleanup3_count0:
+    mov qword [preempt_test_fail_stage], 6
     jmp .cleanup3
 .cleanup3_count1:
-    mov qword [preempt_test_fail_stage], 3
+    mov qword [preempt_test_fail_stage], 7
     jmp .cleanup3
 .cleanup3_count2:
-    mov qword [preempt_test_fail_stage], 4
+    mov qword [preempt_test_fail_stage], 8
     jmp .cleanup3
 .cleanup3_no_preempt:
-    mov qword [preempt_test_fail_stage], 5
+    mov qword [preempt_test_fail_stage], 9
+    jmp .cleanup3
+.cleanup3_no_switch:
+    mov qword [preempt_test_fail_stage], 10
+    jmp .cleanup3
+.cleanup3_bad_current:
+    mov qword [preempt_test_fail_stage], 11
+    jmp .cleanup3
+.fail_stage_cleanup_count:
+    mov qword [preempt_test_fail_stage], 12
+    jmp .fail
+.fail_stage_cleanup_ready:
+    mov qword [preempt_test_fail_stage], 13
+    jmp .fail
+.fail_after_cleanup:
+    mov qword [preempt_test_fail_stage], 14
+    jmp .fail
+
 .cleanup3:
+    cli
     call scheduler_disable_preemption
     mov rdi, [preempt_test_threads + 0]
     test rdi, rdi
     jz .cleanup3_b
+    cmp qword [current_thread], rdi
+    je .cleanup3_b
     call thread_destroy
     mov qword [preempt_test_threads + 0], 0
 .cleanup3_b:
     mov rdi, [preempt_test_threads + 8]
     test rdi, rdi
     jz .cleanup3_c
+    cmp qword [current_thread], rdi
+    je .cleanup3_c
     call thread_destroy
     mov qword [preempt_test_threads + 8], 0
 .cleanup3_c:
     mov rdi, [preempt_test_threads + 16]
     test rdi, rdi
-    jz .cleanup_fail
+    jz .fail
+    cmp qword [current_thread], rdi
+    je .fail
     call thread_destroy
     mov qword [preempt_test_threads + 16], 0
-.cleanup_fail:
     jmp .fail
+
 .cleanup2:
+    mov qword [preempt_test_fail_stage], 15
     mov rdi, [preempt_test_threads + 0]
-    test rdi, rdi
-    jz .cleanup2_b
-    call thread_destroy
-    mov qword [preempt_test_threads + 0], 0
-.cleanup2_b:
-    mov rdi, [preempt_test_threads + 8]
     test rdi, rdi
     jz .fail
     call thread_destroy
-    mov qword [preempt_test_threads + 8], 0
+    mov qword [preempt_test_threads + 0], 0
     jmp .fail
 .cleanup1:
+    mov qword [preempt_test_fail_stage], 16
     mov rdi, [preempt_test_threads + 0]
     test rdi, rdi
     jz .fail
     call thread_destroy
     mov qword [preempt_test_threads + 0], 0
+
 .fail:
     call scheduler_disable_preemption
     lea r9, [msg_preempt_test_fail]
@@ -10683,8 +10912,48 @@ preemptive_scheduler_test:
     mov eax, [preempt_test_fail_stage]
     test eax, eax
     jnz .fail_code_ready
-    mov eax, 1
+    mov eax, 17
 .fail_code_ready:
+    push rax
+    lea r9, [str_preempt_fail_stage]
+    call draw_text
+    mov rcx, [preempt_test_fail_stage]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+    lea r9, [str_preempt_fail_ticks]
+    call draw_text
+    mov rcx, [lapic_timer_ticks]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+    lea r9, [str_preempt_fail_preempts]
+    call draw_text
+    mov rcx, [scheduler_preemptions]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+    lea r9, [str_preempt_fail_switches]
+    call draw_text
+    mov rcx, [scheduler_context_switches]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+    lea r9, [str_preempt_fail_counts]
+    call draw_text
+    mov rcx, [preempt_test_counts + 0]
+    call print_hex64
+    mov r9b, KEY_SPACE
+    call console_putc
+    mov rcx, [preempt_test_counts + 8]
+    call print_hex64
+    mov r9b, KEY_SPACE
+    call console_putc
+    mov rcx, [preempt_test_counts + 16]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+    pop rax
     add rsp, 8
     pop r14
     pop r13
@@ -10692,6 +10961,9 @@ preemptive_scheduler_test:
     ret
 
 preempt_test_worker:
+    ; The worker is the actual preemption target. Explicitly enable interrupts
+    ; here so the test does not depend on the saved cooperative RFLAGS state.
+    sti
     ; Deliberately CPU-bound: the worker never calls scheduler_yield().
     ; A sufficiently large deterministic loop gives the LAPIC timer a real
     ; opportunity to preempt the current thread without making the test
@@ -13548,6 +13820,10 @@ msg_bpmm_ok:
 
 msg_bpmm_fail:
     db "Buddy PMM: FAIL",10,0
+str_bpmm_fail_stage:
+    db "Buddy PMM failure stage: 0x",0
+str_bpmm_fail_heads:
+    db "Buddy PMM heads: ",0
 
 buddy_pmm_fail_stage:
     dq 0
@@ -13562,7 +13838,9 @@ align 8
 buddy_pmm_heads:
     times (BUDDY_PMM_ORDER + 1) dq 0
 
-align 16
+; The buddy arena must begin on an order-9 boundary. The allocator uses
+; XOR buddy addresses, so an unaligned base is fundamentally invalid.
+align BUDDY_PMM_BLOCK_SIZE
 buddy_pmm_pool_raw:
     times (2 * BUDDY_PMM_BLOCK_SIZE) db 0
 
@@ -14086,6 +14364,20 @@ str_diag2_failure_dot:
 
 str_diag2_problem:
     db "   Problem: ",0
+str_diag2_debug_stage:
+    db "   Debug stage: 0x",0
+str_diag2_debug_pool:
+    db "   Debug pool: 0x",0
+str_diag2_debug_heads:
+    db "   Debug heads[0..9]: ",0
+str_diag2_debug_ticks:
+    db "   Debug timer_ticks: 0x",0
+str_diag2_debug_preempts:
+    db "   Debug preemptions: 0x",0
+str_diag2_debug_switches:
+    db "   Debug context_switches: 0x",0
+str_diag2_debug_workers:
+    db "   Debug worker_rounds: ",0
 
 msg_diag2_environment:
     db "[ENVIRONMENT SNAPSHOT]",10,0
@@ -14302,6 +14594,16 @@ reason_diag2_scheduler:
     db "cooperative round-robin scheduler self-test returned failure",10,0
 reason_diag2_preempt:
     db "preemptive scheduler self-test returned failure",10,0
+str_preempt_fail_stage:
+    db "Preemptive scheduler failure stage: 0x",0
+str_preempt_fail_ticks:
+    db "Timer ticks observed: 0x",0
+str_preempt_fail_preempts:
+    db "Scheduler preemptions: 0x",0
+str_preempt_fail_switches:
+    db "Scheduler context switches: 0x",0
+str_preempt_fail_counts:
+    db "Worker rounds: 0x",0
 reason_diag2_lapic:
     db "Local APIC support/base/timer/SVR/vector state is invalid",10,0
 reason_diag2_pmm_stress:
