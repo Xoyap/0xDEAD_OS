@@ -9552,8 +9552,24 @@ context_switch:
     mov r15, [rsi + CTX_R15]
 
     mov rax, [rsi + CTX_RFLAGS]
+    ; A preemptive scheduler context must never be resumed with IF=0.
+    ; The saved cooperative context may have been created while the
+    ; diagnostic/test path had interrupts disabled, so enforce interrupt
+    ; enablement at the final context-switch boundary.
+    cmp qword [preemptive_scheduler_enabled], 1
+    jne .restore_flags
+    or rax, 0x200
+.restore_flags:
     push rax
     popfq
+    ; POPFQ restores IF architecturally, but make the preemptive entry
+    ; boundary explicit. STI takes effect after the following instruction,
+    ; which is RET, so the freshly dispatched worker can receive the LAPIC
+    ; timer immediately after entering its own context.
+    cmp qword [preemptive_scheduler_enabled], 1
+    jne .ret_context
+    sti
+.ret_context:
     ret
 
 ; rdi = Context *, rsi = stack_top, rdx = entry
@@ -9901,7 +9917,8 @@ thread_create:
     rep stosq
 
     ; Valid synthetic ring-0 IRET frame for first preemptive dispatch.
-    mov qword [r12 + TH_IRQ_RSP + PREEMPT_RIP_OFFSET], thread_bootstrap
+    lea rax, [rel thread_bootstrap]
+    mov [r12 + TH_IRQ_RSP + PREEMPT_RIP_OFFSET], rax
     mov qword [r12 + TH_IRQ_RSP + PREEMPT_CS_OFFSET], KERNEL_CS
     mov qword [r12 + TH_IRQ_RSP + PREEMPT_RFLAGS_OFFSET], KERNEL_RFLAGS
     mov qword [r12 + TH_FLAGS], THREAD_FLAG_PREEMPTIBLE
@@ -10065,9 +10082,10 @@ scheduler_timer_tick:
     mov r15, rdi
     mov qword [scheduler_in_irq], 1
     inc qword [scheduler_tick_count]
+    inc qword [scheduler_irq_entries]
 
     cmp qword [preemptive_scheduler_enabled], 1
-    jne .same
+    jne .same_disabled
 
     mov r12, [current_thread]
     test r12, r12
@@ -10075,16 +10093,26 @@ scheduler_timer_tick:
     cmp qword [r12 + TH_MAGIC], THREAD_MAGIC
     jne .same
     cmp qword [r12 + TH_STATE], THREAD_STATE_RUNNING
-    jne .same
+    jne .same_not_running
 
     mov [r12 + TH_IRQ_RSP], r15
     or qword [r12 + TH_FLAGS], THREAD_FLAG_STARTED
     inc qword [r12 + TH_RUNTIME_TICKS]
-    inc qword [r12 + TH_PREEMPT_COUNT]
     inc qword [r12 + TH_SLICE_TICKS]
 
+    ; The preemption self-test can request one deterministic preemption on
+    ; the first real timer IRQ. This is test-only and is cleared immediately
+    ; when consumed; normal scheduling still uses SCHED_QUANTUM_TICKS.
+    cmp qword [scheduler_test_force_preempt], 1
+    jne .check_quantum
+    cmp r12, [scheduler_return_thread]
+    je .check_quantum
+    mov qword [scheduler_test_force_preempt], 0
+    jmp .quantum_hit
+.check_quantum:
     cmp qword [r12 + TH_SLICE_TICKS], SCHED_QUANTUM_TICKS
     jb .same
+.quantum_hit:
     mov qword [r12 + TH_SLICE_TICKS], 0
 
     cmp r12, [scheduler_return_thread]
@@ -10112,6 +10140,7 @@ scheduler_timer_tick:
     mov qword [r13 + TH_SLICE_TICKS], 0
     inc qword [scheduler_context_switches]
     inc qword [scheduler_preemptions]
+    inc qword [r12 + TH_PREEMPT_COUNT]
 
     mov r14, [r12 + TH_PROCESS]
     mov rax, [r13 + TH_PROCESS]
@@ -10147,8 +10176,48 @@ scheduler_timer_tick:
     mov [current_process], rax
     mov qword [rax + PR_STATE], PROCESS_STATE_RUNNING
 .same_process:
+    ; A READY thread that has never received an IRQ does not own a live
+    ; interrupt frame.  Do not IRET through its synthetic TH_IRQ_RSP.
+    ; Instead, reuse the current IRQ frame and turn its RIP into a small
+    ; first-dispatch trampoline.  The trampoline switches RSP to the new
+    ; thread's private stack and enters thread_bootstrap.
+    test qword [r13 + TH_FLAGS], THREAD_FLAG_STARTED
+    jnz .next_frame_ready
+    mov qword [r15 + 0], 0              ; RAX
+    mov qword [r15 + 8], 0              ; RBX
+    mov qword [r15 + 16], 0             ; RCX
+    mov qword [r15 + 24], 0             ; RDX
+    mov qword [r15 + 32], 0             ; RSI
+    mov qword [r15 + 40], 0             ; RDI
+    mov qword [r15 + 48], 0             ; RBP
+    mov qword [r15 + 56], 0             ; R8
+    mov qword [r15 + 64], 0             ; R9
+    mov qword [r15 + 72], 0             ; R10
+    mov qword [r15 + 80], 0             ; R11
+    mov [r15 + 24], r13                 ; R12 = first-dispatch thread
+    mov qword [r15 + 96], 0             ; R13
+    mov qword [r15 + 104], 0            ; R14
+    mov qword [r15 + 112], 0            ; R15
+    mov qword [r15 + PREEMPT_VECTOR_OFFSET], LAPIC_TIMER_VECTOR
+    mov qword [r15 + PREEMPT_ERROR_OFFSET], 0
+    lea rax, [rel scheduler_first_dispatch]
+    mov [r15 + PREEMPT_RIP_OFFSET], rax
+    mov qword [r15 + PREEMPT_CS_OFFSET], KERNEL_CS
+    mov qword [r15 + PREEMPT_RFLAGS_OFFSET], KERNEL_RFLAGS
+    mov rax, r15
+    jmp .done
+
+.next_frame_ready:
     mov rax, [r13 + TH_IRQ_RSP]
     jmp .done
+
+.same_disabled:
+    inc qword [scheduler_disabled_irq_entries]
+    jmp .same
+
+.same_not_running:
+    inc qword [scheduler_not_running_entries]
+    jmp .same
 
 .same_restore:
     mov qword [r12 + TH_STATE], THREAD_STATE_RUNNING
@@ -10331,6 +10400,12 @@ scheduler_thread_exit:
 .halt_loop:
     hlt
     jmp .halt_loop
+
+; Entered by IRETQ only for a thread that has never been interrupted.
+; R12 is populated in the current IRQ frame with the destination thread.
+scheduler_first_dispatch:
+    mov rsp, [r12 + TH_STACK_TOP]
+    jmp thread_bootstrap
 
 thread_bootstrap:
     mov r12, [current_thread]
@@ -10707,12 +10782,23 @@ preemptive_scheduler_test:
     cmp byte [lapic_timer_started], 1
     jne .fail_stage_timer_not_started
 
+    ; Re-arm the hardware timer immediately before the preemption test.
+    ; The diagnostic suite deliberately runs with IF=0 and other tests may
+    ; have touched APIC state, so relying on an earlier boot-time start makes
+    ; this test dependent on unrelated test ordering.
+    call lapic_timer_start
+    test eax, eax
+    jnz .fail_stage_timer_not_started
+
     lea rdi, [scheduler_test_main]
     call scheduler_main_init
     test eax, eax
     jnz .fail_stage_main_init
 
     mov qword [preempt_test_fail_stage], 0
+    mov qword [scheduler_irq_entries], 0
+    mov qword [scheduler_disabled_irq_entries], 0
+    mov qword [scheduler_not_running_entries], 0
     mov qword [preempt_test_total], 0
     mov qword [preempt_test_counts + 0], 0
     mov qword [preempt_test_counts + 8], 0
@@ -10721,7 +10807,17 @@ preemptive_scheduler_test:
     mov qword [preempt_test_threads + 8], 0
     mov qword [preempt_test_threads + 16], 0
 
-    mov r12, [lapic_timer_ticks]
+    mov rax, [lapic_timer_ticks]
+    mov [preempt_test_timer_before], rax
+
+    ; Capture the live LAPIC countdown immediately before dispatch.
+    mov rax, [lapic_virt_base]
+    test rax, rax
+    jz .fail_stage_timer_not_started
+    mov eax, dword [rax + LAPIC_TIMER_CUR]
+    mov [preempt_test_lapic_cur_before], rax
+    mov eax, dword [rax + LAPIC_LVT_TIMER]
+    mov [preempt_test_lapic_lvt_before], rax
 
     lea rdi, [preempt_test_worker]
     lea rsi, [preempt_test_args + 0]
@@ -10753,6 +10849,9 @@ preemptive_scheduler_test:
     mov rdi, [preempt_test_threads + 16]
     or qword [rdi + TH_CTX + CTX_RFLAGS], 0x200
 
+    ; Force exactly one real timer IRQ to exercise the preemption path even
+    ; if the worker workload happens to finish before the normal 10-tick quantum.
+    mov qword [scheduler_test_force_preempt], 1
     call scheduler_enable_preemption
 
     ; Keep the shell/main context interrupt-disabled while scheduler_start
@@ -10764,10 +10863,11 @@ preemptive_scheduler_test:
     call scheduler_start
     cli
     call scheduler_disable_preemption
+    mov qword [scheduler_test_force_preempt], 0
 
     ; Timer must have delivered real interrupts during the test.
     mov rax, [lapic_timer_ticks]
-    cmp rax, r12
+    cmp rax, [preempt_test_timer_before]
     jbe .cleanup3_no_ticks
 
     cmp qword [preempt_test_counts + 0], PREEMPT_TEST_ROUNDS
@@ -10939,6 +11039,24 @@ preemptive_scheduler_test:
     call print_hex64
     mov r9b, CHAR_LF
     call console_putc
+    lea r9, [str_preempt_fail_irq_entries]
+    call draw_text
+    mov rcx, [scheduler_irq_entries]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+    lea r9, [str_preempt_fail_disabled_irqs]
+    call draw_text
+    mov rcx, [scheduler_disabled_irq_entries]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
+    lea r9, [str_preempt_fail_not_running]
+    call draw_text
+    mov rcx, [scheduler_not_running_entries]
+    call print_hex64
+    mov r9b, CHAR_LF
+    call console_putc
     lea r9, [str_preempt_fail_counts]
     call draw_text
     mov rcx, [preempt_test_counts + 0]
@@ -10975,7 +11093,7 @@ preempt_test_worker:
 .loop:
     inc qword [r14]
     inc qword [preempt_test_total]
-    mov rcx, 50000000
+    mov rcx, 500000000
 .busy:
     dec rcx
     jnz .busy
@@ -11287,6 +11405,9 @@ scheduler_start:
     mov r13, rax
     mov qword [r13 + TH_STATE], THREAD_STATE_RUNNING
     mov [current_thread], r13
+    ; Make the initial destination context explicitly interruptible before
+    ; the first switch. context_switch also enforces IF at its final boundary.
+    or qword [r13 + TH_CTX + CTX_RFLAGS], 0x200
     lea rdi, [r12 + TH_CTX]
     lea rsi, [r13 + TH_CTX]
     call context_switch
@@ -12146,13 +12267,23 @@ lapic_timer_start:
     test eax, eax
     jz .fail
 
+    ; Re-program every timer control register at start. Calibration also
+    ; programs the divider, but the timer must not depend on that earlier
+    ; state surviving later APIC operations.
     mov dword [rbx + LAPIC_ESR], 0
     mov dword [rbx + LAPIC_EOI], 0
     mov dword [rbx + LAPIC_TPR], 0
+    mov dword [rbx + LAPIC_TIMER_DIV], LAPIC_TIMER_DIV_16
+
+    ; CR8 is the CPU-side APIC priority threshold. Keep it at the
+    ; interruptible priority while the kernel timer is active.
+    xor eax, eax
+    mov cr8, rax
 
     ; Vector 32, periodic, unmasked.
     mov eax, LAPIC_TIMER_VECTOR | LAPIC_LVT_PERIODIC
     mov dword [rbx + LAPIC_LVT_TIMER], eax
+    ; Writing INIT_COUNT starts/restarts the periodic countdown.
     mov eax, [lapic_initial_count]
     mov dword [rbx + LAPIC_TIMER_INIT], eax
 
@@ -14324,6 +14455,21 @@ scheduler_context_switches:
     dq 0
 scheduler_preemptions:
     dq 0
+scheduler_irq_entries:
+    dq 0
+scheduler_disabled_irq_entries:
+    dq 0
+scheduler_not_running_entries:
+    dq 0
+scheduler_test_force_preempt:
+    dq 0
+align 8
+preempt_test_lapic_cur_before:
+    dq 0
+preempt_test_timer_before:
+    dq 0
+preempt_test_lapic_lvt_before:
+    dq 0
 
 ; Diagnostic checkpoint: 1=foundation, 2=threads, 3=process,
 ; 4=scheduler, 5=preemption, 6=stress.  Updated before every phase.
@@ -14602,6 +14748,12 @@ str_preempt_fail_preempts:
     db "Scheduler preemptions: 0x",0
 str_preempt_fail_switches:
     db "Scheduler context switches: 0x",0
+str_preempt_fail_irq_entries:
+    db "Scheduler IRQ entries: 0x",0
+str_preempt_fail_disabled_irqs:
+    db "IRQs while preemption disabled: 0x",0
+str_preempt_fail_not_running:
+    db "IRQs with current thread not RUNNING: 0x",0
 str_preempt_fail_counts:
     db "Worker rounds: 0x",0
 reason_diag2_lapic:
